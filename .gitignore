@@ -1,0 +1,5 @@
+swarmsheriff
+*.log
+.DS_Store
+graphify-out/
+*.sqlite3*
