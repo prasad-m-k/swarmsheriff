@@ -158,7 +158,11 @@ func TestSentinelFailsClosed(t *testing.T) {
 			t.Errorf("%s: status %d, upstream %v, log %s", c.rule, w.Code, *seen != nil, logs)
 		}
 	}
-	p.sentinel.base = "http://127.0.0.1:1" // engine unreachable
+	// Engine unreachable. A copy, so the sink goroutine still reading the
+	// original client does not race with the change.
+	unreachable := *p.sentinel
+	unreachable.base = "http://127.0.0.1:1"
+	p.sentinel = &unreachable
 	if w := post(p, "/"+host+"/v1/messages", sentinelBody, map[string]string{headerCredential: "ssa_any"}); w.Code != http.StatusForbidden {
 		t.Errorf("unreachable engine: status %d", w.Code)
 	}
