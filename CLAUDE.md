@@ -11,7 +11,7 @@ swarmsheriff has two jobs:
 
 Job 1 exists today. Job 2's phase 1 pieces (policy, decision pipeline, report/enforce proxy, classifier interface, file sink, eval) are built. Read "Status" before changing anything.
 
-The project uses the standard library plus one approved dependency, `modernc.org/sqlite` (pure Go, no cgo) for the metrics store. Ask before adding any other.
+The project uses the standard library plus these approved dependencies: `modernc.org/sqlite` (pure Go, no cgo) for the metrics store, and `google.golang.org/grpc` with `github.com/envoyproxy/go-control-plane/envoy` for the Google Agent Gateway extension (Envoy ext_proc). Ask before adding any other.
 
 ## Status
 
@@ -23,7 +23,7 @@ The project uses the standard library plus one approved dependency, `modernc.org
 | Loopback `/scan` and `/healthz` endpoint | Built, returns findings only |
 | Rotating log | Built |
 | Metrics store (local SQLite) and `swarmsheriff metrics query/export/clear` | Built (phase 1); dashboard planned (phase 2) |
-| Agent lifecycle metrics from Claude Code and Antigravity hooks (time in state, blocked time, turns, operator waits, errors, stalls), launch stats, CPU and memory per AI app | Built (phase 1.1) |
+| Agent lifecycle metrics from Claude Code, Antigravity and Gemini CLI hooks (time in state, blocked time, turns, operator waits, errors, stalls), launch stats, CPU and memory per AI app | Built (phase 1.1) |
 | Declarative hook adapters: add a new agent via a JSON file, no recompile | Built (phase 1.1) |
 | Local web dashboard over the metrics database (`swarmsheriff dashboard`) | Built (phase 2) |
 | Policy file, classes, destination matrix | Built (`policy.go`, `policy.example.json`), reloaded on change |
@@ -33,6 +33,8 @@ The project uses the standard library plus one approved dependency, `modernc.org
 | Decision events | File sink built (`events.go`); asynchronous HTTP sink to SwarmSentinel's recorder built (`sentinel.go`) |
 | SwarmSentinel link: engine-issued agent identity and confidentiality labels | Built (`sentinel.go`, `-sentinel`, `-require-credential`); fails closed on unverifiable credentials and revoked agents |
 | `-eval` against a labeled corpus | Built (`eval.go`); seed corpus is far below the 200 samples per class the exit criteria need |
+| Google Agent Gateway authorization extension (CONTENT_AUTHZ, Envoy ext_proc over TLS) | Built (`gateway.go`, `-gateway-listen`), off by default; tested in-process, not yet against a live gateway |
+| Gemini and Vertex AI through the proxy (model from the path, `usageMetadata` tokens, Google error shape) | Built |
 | Surrogate translation (DPTP) | Interface stub only |
 | c11 integration (agent identity, sidebar) | Out of scope until phase 3 |
 
@@ -68,6 +70,7 @@ Enforcement flags (all listed in the `swarmsheriff started` log line):
 -metrics=true                 # body-free metrics in SQLite; -metrics-db, -metrics-retention 720h (30d), -metrics-max-mb 256
 -sentinel http://127.0.0.1:8000 -sentinel-secret-file f   # SwarmSentinel link (egress endpoints, shared secret)
 -require-credential           # refuse proxy requests without an engine-issued agent credential
+-gateway-listen 10.0.0.5:443 -gateway-cert c.pem -gateway-key k.pem   # Agent Gateway extension; not loopback, TLS required
 ```
 
 Read the metrics store with or without swarmsheriff running:
@@ -90,6 +93,7 @@ Point agents at the proxy with the upstream host as the first path segment:
 ```
 ANTHROPIC_BASE_URL=http://127.0.0.1:8788/api.anthropic.com
 OPENAI_BASE_URL=http://127.0.0.1:8788/api.openai.com/v1
+GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8788/generativelanguage.googleapis.com
 ```
 
 Optional request headers, stripped before forwarding: `X-Swarmsheriff-Labels` (comma-separated source labels), `X-Swarmsheriff-Agent` (declared agent ID) and `X-Swarmsheriff-Credential` (the agent's SwarmSentinel MCP credential; with `-sentinel` it is resolved to an engine-issued identity, task and confidentiality labels such as `asp:credentials`).
@@ -115,7 +119,8 @@ Everything is `package main` in the repo root unless a file says otherwise.
 | `policy.go` | Load and validate the JSON policy; `Verdict`; class definitions; destination matrix; path globs |
 | `decide.go` | The decision pipeline (`decider.decide`); returns a `Decision`; classifier features |
 | `classify.go` | `Classifier` interface, `noopClassifier`, the Jev implementation |
-| `proxy.go` | LLM reverse proxy; calls `decide`; blocks or forwards; block response shape |
+| `proxy.go` | LLM reverse proxy; `judge` (identity, `decide`, events) shared with the gateway; blocks or forwards; block response shapes |
+| `gateway.go` | Google Agent Gateway CONTENT_AUTHZ extension: Envoy ext_proc server, buffers the request body, then 403 or passes it back unchanged |
 | `events.go` | `Sink` interface and the logfmt file sink |
 | `sentinel.go` | SwarmSentinel link: credential resolution, the asynchronous recorder sink, `multiSink` |
 | `translate.go` | `Translator` interface stub for surrogate values (DPTP) |
@@ -146,14 +151,14 @@ Existing:
 - Log files are created with mode `0600`.
 - Repeated errors are logged once per distinct message (`lastErr` pattern), not on every tick.
 - The metrics store is body-free: rows hold kinds, labels, counts, timings, and token-usage integers, never clipboard text, request content, prompts, responses, or command lines. Intake source and site labels are capped at 64 bytes. The database is created 0600 in a 0700 directory; symlinks are refused.
-- `swarmsheriff hook [--agent <kind>]` maps each agent's own hook payload to a lifecycle event and keeps only the event name, opaque IDs (c11's rule: printable ASCII, no spaces or slashes, at most 128 bytes) and a model name. Claude Code is the default; `--agent antigravity` reads Antigravity's `conversationId`/`toolCall`/`modelName` payload. It never forwards prompts, tool input or output, transcript or workspace paths, or notification text. It never forwards prompts, tool input or output, or notification text, prints nothing to stdout, and always exits 0. The hook socket is 0600 in a 0700 directory, and the server re-validates every field.
+- `swarmsheriff hook [--agent <kind>]` maps each agent's own hook payload to a lifecycle event and keeps only the event name, opaque IDs (c11's rule: printable ASCII, no spaces or slashes, at most 128 bytes) and a model name. Claude Code is the default; `--agent antigravity` reads Antigravity's `conversationId`/`toolCall`/`modelName` payload; `--agent gemini-cli` reads Gemini CLI's `session_id` and the model from `llm_request.model`. It never forwards prompts, tool input or output, transcript or workspace paths, or notification text. It never forwards prompts, tool input or output, or notification text, prints nothing to stdout, and always exits 0. The hook socket is 0600 in a 0700 directory, and the server re-validates every field.
 - `Record` never blocks a caller: a full buffer drops the event and counts it in `meta.dropped_events`.
 - The clipboard guard is off by default. Its notice names rules and counts only, and guarded text is never logged, whatever `-log-content` says.
 
 New, for the enforcement work:
 
 - A `Decision` carries class IDs, rule names, confidence, verdict, mode, agent ID, and destination host. It never carries request content, matched text, or prompts. The same holds for every event sent to a sink.
-- The proxy binds to loopback only, reusing `isLoopback`. It does no TLS interception. Agents reach it through a base-URL override (for example `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` pointing at `http://127.0.0.1:<port>`).
+- The proxy binds to loopback only, reusing `isLoopback`. It does no TLS interception. The one listener that is not loopback is the opt-in Agent Gateway extension (`-gateway-listen`), off by default, which refuses to start without a TLS certificate and key and holds request bodies in memory only until it decides, like the proxy. Agents reach it through a base-URL override (for example `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` pointing at `http://127.0.0.1:<port>`).
 - Request bodies are capped. Streaming responses pass through as they arrive; the proxy scans them in flight only to read the `usage` token counts, keeping the integers and never buffering or storing the body. The proxy never stores a request or response body, in memory beyond the request or on disk.
 - API keys and authorization headers pass through to the upstream and are never logged.
 - A hosted classifier never receives raw request content by default. It receives features (path labels, document markers, length, rule counts) or text that has already been through the `Translator`. A class may opt in to raw content only with `"classifier_raw": true` in the policy, and that choice must be visible in the startup log.
@@ -194,7 +199,7 @@ JSON, because the standard library has no YAML parser. Classes are data. Adding 
   "destinations": {
     "approved-tenant": ["api.company-llm.example"],
     "consumer-chat": ["chatgpt.com", "claude.ai", "gemini.google.com"],
-    "public-api": ["api.openai.com", "api.anthropic.com", "openrouter.ai"]
+    "public-api": ["api.openai.com", "api.anthropic.com", "generativelanguage.googleapis.com", "aiplatform.googleapis.com", "openrouter.ai"]
   },
   "classes": [
     {
@@ -278,6 +283,8 @@ swarmsheriff must work for any agent, so each integration path has a defined rol
 | Clipboard | Polling watcher; `-clipboard-guard` overwrites the clipboard on a match (`ai`: while an AI site in Chrome or a desktop AI app is open) | Partly | Race between polls; typed text not covered; AI context only from Chrome on macOS and the process list |
 | Browser chats | Extension posts to `/scan` and blocks submit | Yes, with extension | Needs a managed extension; not built yet |
 | Desktop AI apps | Process watching for inventory | No | Needs network egress rules to block |
+| Agents on Google Cloud behind Agent Gateway | CONTENT_AUTHZ authorization extension (`-gateway-listen`) | Yes | Only traffic the gateway sends to the extension; CONTENT_AUTHZ can fail open on connection errors; the agent's SPIFFE identity is not passed to extensions |
+| Antigravity (IDE, 2.0 desktop, `agy` CLI) signed in with Google | Hooks for metrics; process watching | No | Model traffic goes straight to Google over TLS with no base-URL override |
 | Other machines and employees | Out of scope for the local binary | No | Needs endpoint rollout and an egress gateway |
 
 A local tool stops accidents, not deliberate exfiltration through another device. Say so in any user-facing docs.

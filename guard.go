@@ -25,7 +25,7 @@ const (
 
 // defaultGuardRules are the findings worth wiping a clipboard for. Email is
 // left out: copying an address is routine and wiping it would be noise.
-const defaultGuardRules = "credit-card,us-ssn,private-key,aws-access-key,gcp-api-key," +
+const defaultGuardRules = "credit-card,us-ssn,private-key,aws-access-key,gcp-api-key,google-oauth-token," +
 	"openai-key,anthropic-key,github-token,slack-token,jwt,keyword:*"
 
 type clipboardGuard struct {

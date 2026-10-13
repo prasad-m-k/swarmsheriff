@@ -42,7 +42,7 @@ flowchart LR
     OS[OS tools: pbpaste, ps, osascript]
     PFILE[policy.json]
   end
-  LLM[LLM APIs: Anthropic, OpenAI, tenant]
+  LLM[LLM APIs: Anthropic, OpenAI, Gemini, tenant]
   OR[OpenRouter: Jev]
   SS[SwarmSentinel, phase 2]
 
@@ -130,20 +130,24 @@ Verdicts are ordered `allow < translate < hold < block`. In phase 1 the proxy tr
 
 ### Inbound
 
-Both servers bind to loopback only and refuse to start on any other address.
+The proxy and intake bind to loopback only and refuse to start on any other address. The Agent Gateway extension is the exception: Google's gateway calls it over the VPC, so it binds where `-gateway-listen` says, and only with TLS.
 
 | Endpoint | Server, flag | Method | Auth | Request | Response |
 | --- | --- | --- | --- | --- | --- |
 | `/<upstream-host>/<path>` | Proxy, `-proxy 127.0.0.1:8788` | Any | None of its own; the agent's API key passes through to the upstream | The provider's own request; optional `X-Swarmsheriff-Labels`, `X-Swarmsheriff-Agent` | Upstream response, streamed; or an swarmsheriff error JSON |
 | `/scan` | Intake, `-listen 127.0.0.1:8787` | POST | `Authorization: Bearer <token>` or `X-Swarmsheriff-Token` | `{"source","site","text"}`, at most 4 MiB | `{"flagged":bool,"findings":[{"rule","count"}]}` |
 | `/healthz` | Intake | Any | None | None | 200, empty |
+| gRPC `envoy.service.ext_proc.v3.ExternalProcessor/Process` | Agent Gateway extension, `-gateway-listen` | Bidirectional stream, HTTP/2 over TLS | TLS only; restrict reachability with VPC firewall rules (see `docs/gcp-agent-gateway.md`) | ext_proc `FULL_DUPLEX_STREAMED` messages for one HTTP request and its response | `HeadersResponse` (strips `X-Swarmsheriff-*`), the request body handed back unchanged, or an `ImmediateResponse` 403 or 413 with the error JSON for that host |
 
 Agents reach the proxy with a base-URL override whose first path segment is the upstream host:
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8788/api.anthropic.com
 OPENAI_BASE_URL=http://127.0.0.1:8788/api.openai.com/v1
+GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8788/generativelanguage.googleapis.com
 ```
+
+Gemini and Vertex AI name the model in the path (`v1beta/models/gemini-2.5-pro:generateContent`), so the proxy reads it from there when the body has no `model` field. Token counts come from `usageMetadata` (`promptTokenCount`; `candidatesTokenCount` plus `thoughtsTokenCount` as output). The query string, which may hold a Gemini `?key=`, is forwarded unchanged; an upstream failure is logged without the URL.
 
 Proxy status codes:
 
@@ -157,7 +161,7 @@ Proxy status codes:
 | 502 | `api_error` | Upstream connection failed |
 | other | upstream's own | Anything the upstream returns passes through unchanged |
 
-Error bodies have the shape `{"type":"error","error":{"type":"...","message":"..."}}`, which both the Anthropic and OpenAI SDKs parse.
+Error bodies have the shape `{"type":"error","error":{"type":"...","message":"..."}}`, which both the Anthropic and OpenAI SDKs parse. For Google hosts (`*.googleapis.com`) they take Google's shape instead, `{"error":{"code":403,"message":"...","status":"PERMISSION_DENIED"}}`, with `status` set to `PERMISSION_DENIED`, `NOT_FOUND`, `INVALID_ARGUMENT` or `UNAVAILABLE` to match the HTTP status.
 
 Intake status codes: 405 for a non-POST to `/scan`, 401 for a missing or wrong token, 400 for bad JSON or an oversized body.
 
@@ -177,7 +181,7 @@ Intake status codes: 405 for a non-POST to `/scan`, 401 for a missing or wrong t
 | `swarmsheriff metrics export [--from] [--to] [--output path]` | Read-only | Body-free NDJSON in event order; output file created 0600 |
 | `swarmsheriff metrics clear --yes` | Read-write | Deletes all rows and vacuums |
 | `swarmsheriff hook [Event] [--socket path]` | None; posts to the hook socket | Nothing on stdout; always exits 0 |
-| `swarmsheriff hook --print-config [agent]` | None | That agent's hooks config fragment (default claude-code; also antigravity) |
+| `swarmsheriff hook --print-config [agent]` | None | That agent's hooks config fragment (default claude-code; also antigravity, gemini-cli) |
 
 Query also takes `--agent-kind`, `--model`, and `--stall-ms`.
 
@@ -237,6 +241,7 @@ Each runs under a 3 second timeout so a hung tool cannot stall the loop.
 | `-metrics-retention`, `-metrics-max-mb` | 720h (30 days), 256 | Retention window and size cap |
 | `-hooks`, `-hook-socket` | true, `<user config dir>/swarmsheriff/hooks.sock` | Accept lifecycle events from `swarmsheriff hook` |
 | `-dashboard` | `127.0.0.1:9090` | Serve the dashboard in-process (empty = off; needs `-metrics`) |
+| `-gateway-listen`, `-gateway-cert`, `-gateway-key` | off | Google Agent Gateway CONTENT_AUTHZ extension address and its TLS certificate and key (needs `-policy`) |
 | `-quiet`, `-once` | false | Console output; print clipboard and exit |
 
 ## Data storage
@@ -271,9 +276,9 @@ Event kinds: `agent_started`, `agent_stopped`, `decision`, `clipboard`, `clipboa
 
 ### Agent lifecycle metrics (phase 1.1, after c11)
 
-An agent runs `swarmsheriff hook [--agent <kind>] <Event>` for each hook; `swarmsheriff hook --print-config [claude-code|antigravity]` prints the config fragment. The command maps that agent's payload (Claude Code as c11's `ClaudeHookMapping` does; Antigravity from its `conversationId`, `toolCall`, `modelName` payload) and sends only the event name, opaque session/prompt/tool-use IDs, a tool class (`ask_user_question`, `exit_plan_mode`, `other`), and the model, over the hook socket. The two built-in agents are hand-written Go; every other agent is added declaratively by dropping a `<name>.json` adapter in the adapters directory (`~/.config/swarmsheriff/adapters/` by default, or `--adapters <dir>`), with no recompile. See `adapters.go` and `docs/adapters/example.json`. `swarmsheriff hook --list-agents` lists built-in and custom agents.
+An agent runs `swarmsheriff hook [--agent <kind>] <Event>` for each hook; `swarmsheriff hook --print-config [claude-code|antigravity|gemini-cli]` prints the config fragment. The command maps that agent's payload (Claude Code as c11's `ClaudeHookMapping` does; Antigravity from its `conversationId`, `toolCall`, `modelName` payload; Gemini CLI from `session_id` and `llm_request.model`) and sends only the event name, opaque session/prompt/tool-use IDs, a tool class (`ask_user_question`, `exit_plan_mode`, `other`), and the model, over the hook socket. The three built-in agents are hand-written Go; every other agent is added declaratively by dropping a `<name>.json` adapter in the adapters directory (`~/.config/swarmsheriff/adapters/` by default, or `--adapters <dir>`), with no recompile. See `adapters.go` and `docs/adapters/example.json`. `swarmsheriff hook --list-agents` lists built-in and custom agents.
 
-Antigravity differs from Claude Code in two ways: it has no session start/end event, so a session is keyed on `conversationId` and first-seen marks it (its sessions appear under `seen`, not `started`); and it signals waiting-on-the-operator through the hook's own `decision` output rather than an event, so operator-wait timing is not available in observe-only mode. `swarmsheriff metrics query` folds them per session:
+Antigravity differs from Claude Code in two ways: it has no session start/end event, so a session is keyed on `conversationId` and first-seen marks it (its sessions appear under `seen`, not `started`); and it signals waiting-on-the-operator through the hook's own `decision` output rather than an event, so operator-wait timing is not available in observe-only mode. Gemini CLI sends `session_id` on every event but no turn or tool-call ID, so its tool events count as activity and cannot resolve a question or plan review; a `ToolPermission` notification counts as an approval request, and `BeforeModel` contributes only the model name. `swarmsheriff metrics query` folds them per session:
 
 | Metric | How it is measured |
 | --- | --- |
@@ -318,6 +323,7 @@ flowchart LR
 | Boundary | Control | Residual risk |
 | --- | --- | --- |
 | Network to swarmsheriff | Proxy and intake bind to loopback only; non-loopback addresses refused at startup | None from the network |
+| VPC to the gateway extension (opt-in) | TLS required; off unless `-gateway-listen` is set; bodies held in memory only until the decision | The gateway presents no client certificate the docs describe, so any host that can reach the port can ask for decisions (which name classes and owners) and add decision rows to the metrics; firewall the port to the gateway's PSC range |
 | Local process to intake | Bearer token, constant-time compare; 4 MiB cap; header, read, and write timeouts | A process that can read swarmsheriff's stderr or flags can learn the token |
 | Local process to proxy | No token: any local process may use it | It only forwards to hosts the caller names, as the caller could do directly; loopback upstreams are refused so it cannot reach other local services |
 | Agent credentials | API keys and `Authorization` pass through untouched; headers are never logged | The proxy sees keys in memory while forwarding |
@@ -344,7 +350,7 @@ flowchart LR
 | 12 | Classifier failure: allow, unless the request carries a source label, then block | Always block; always allow | Keeps agents working when the classifier is down, while labeled data still fails closed |
 | 13 | `hold` and `translate` act as `block` in phase 1 | Forward with a warning | No approval flow or translator exists yet; acting as allow would be silently unsafe |
 | 14 | Oversized bodies get 413 in every mode | Forward unscanned in report mode | An unscanned forward is a blind spot; 32 MB is at or above common provider limits |
-| 15 | One error body shape for Anthropic and OpenAI SDKs | Per-provider error formats | Both SDKs read `error.message` and `error.type`, so one shape surfaces the reason in either |
+| 15 | One error body shape for Anthropic and OpenAI SDKs; Google's shape for Google hosts | One shape everywhere | Both SDKs read `error.message` and `error.type`; Google's SDKs read `error.status`, and an extra integer `code` could break strict OpenAI clients |
 | 16 | Jev: one `noul` question per class per chunk; highest chunk wins; any failure fails the call | One multi-choice question; partial results | Thresholds need a probability per class; a partial answer could understate a class |
 | 17 | `Sink` interface; SwarmSentinel over HTTP, no vendored code | Import SwarmSentinel as a library | The projects have different licenses; swarmsheriff must run without SwarmSentinel present |
 | 18 | Card numbers found by windows of whole digit groups, network prefix 2 to 6, Luhn | One greedy 13-19 digit regex | The greedy match swallowed a trailing expiry or CVV on the same line and missed the card |
@@ -353,6 +359,9 @@ flowchart LR
 | 21 | Body-free events with a label table, batched async writes | Store decisions as JSON blobs; synchronous inserts | Grouping by class or rule stays in SQL; a slow disk can drop metrics but never delays a request |
 | 22 | Agent lifecycle from Claude Code hooks over a Unix socket | Read Claude transcripts; TCP with a token file | Hooks are what c11 trusts most; a 0600 socket needs no token, so no secret has to be stored for the hook command |
 | 23 | Operator wait ends at the next sign of progress; no resume metric | Copy c11's keypress-based response and resume | swarmsheriff sees no keystrokes; reporting `resume_ms` as null is honest, and approval waits are documented as including tool run time |
+| 24 | Agent Gateway integration as a CONTENT_AUTHZ ext_proc extension, using `google.golang.org/grpc` and Envoy's `go-control-plane` | REQUEST_AUTHZ (headers only); hand-written gRPC and protobuf | Data classes need the body; the official types avoid wire bugs; dependencies approved by the owner |
+| 25 | The gateway extension buffers the request body and answers once at end of stream | Decide per chunk | A secret split across chunks would be missed; FULL_DUPLEX_STREAMED lets the server hold chunks and send one streamed body back |
+| 26 | One `judge` step shared by the proxy and the gateway | Separate pipelines | Identity, revocation, decision and events stay identical whichever way a request arrives |
 
 ## Failure behavior
 
@@ -364,6 +373,9 @@ flowchart LR
 | `OPENROUTER_API_KEY` missing with `-classifier jev` | Refuse to start |
 | Upstream unreachable | 502 to the agent; log `upstream failed` |
 | Proxy or intake cannot bind | Log the error and exit with status 1 |
+| Gateway extension cannot bind or load its certificate | Log the error and exit with status 1; `-gateway-listen` without a certificate refuses to start |
+| Gateway extension unreachable or erroring | Agent Gateway applies the extension's `failOpen` setting; set it to `false`. CONTENT_AUTHZ in FULL_DUPLEX_STREAMED is reported to fail open on connection and header failures regardless |
+| Request body through the gateway over `-proxy-max-mb` | 413 in every mode, as in the proxy |
 | No clipboard tool | Exit at startup. Note: this also stops the proxy on a headless machine |
 | Clipboard, `ps`, or `osascript` errors after startup | Log each distinct error once, keep polling |
 | Log rotation error | The write fails and the error is returned to the logger |

@@ -57,6 +57,7 @@ var aiApps = []aiApp{
 	app("Claude Code", exeName("claude"), contains("@anthropic-ai/claude-code")),
 	app("OpenAI Codex CLI", exeName("codex"), contains("@openai/codex")),
 	app("Gemini CLI", exeName("gemini"), contains("@google/gemini-cli")),
+	app("Antigravity CLI", exeName("agy")), // Gemini CLI's successor for consumer tiers
 	app("Antigravity", macApp("Antigravity"), exeName("antigravity")),
 	app("opencode", macApp("opencode"), exeName("opencode"), contains("opencode-ai")),
 	app("Goose", exeName("goose"), contains("block/goose")),

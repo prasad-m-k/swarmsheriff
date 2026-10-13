@@ -8,7 +8,7 @@ What counts as sensitive is up to the company. Source code, prompts, product pla
 
 swarmsheriff has two jobs.
 
-**Sense.** It watches the clipboard, the AI apps running on the machine, and the AI sites open in Chrome. It scans text for secrets, personal data and company keywords, measures agent activity through Claude Code and Antigravity hooks, and records everything in a local, body-free metrics database with a web dashboard on top.
+**Sense.** It watches the clipboard, the AI apps running on the machine, and the AI sites open in Chrome. It scans text for secrets, personal data and company keywords, measures agent activity through Claude Code, Antigravity and Gemini CLI hooks, and records everything in a local, body-free metrics database with a web dashboard on top.
 
 **Decide and enforce.** It sits on the request path to LLM APIs as a loopback reverse proxy, classifies each request against the policy, and returns a verdict of `allow`, `translate`, `hold` or `block`. Report mode is the default: the request goes through and the verdict that would have applied is logged. Enforcement is switched on per class, never globally. Each decision can also be sent to the SwarmSentinel policy engine and flight recorder.
 
@@ -23,17 +23,19 @@ A local tool stops accidents, not deliberate exfiltration through another device
 | Clipboard guard | Built, off by default |
 | Loopback `/scan` and `/healthz` endpoint | Built |
 | Metrics store (SQLite), `metrics` CLI and local dashboard | Built |
-| Agent lifecycle metrics from Claude Code and Antigravity hooks | Built |
+| Agent lifecycle metrics from Claude Code, Antigravity and Gemini CLI hooks | Built |
 | Declarative hook adapters for new agents (JSON, no recompile) | Built |
 | Policy file, decision pipeline, LLM reverse proxy | Built, report mode by default |
 | Classifier interface with a Jev (OpenRouter) client | Built, not yet calibrated against live traffic |
 | Decision events to a file sink and to SwarmSentinel | Built |
+| Gemini and Vertex AI through the proxy | Built |
+| Google Agent Gateway authorization extension (CONTENT_AUTHZ) | Built, off by default; not yet run against a live gateway |
 | `-eval` against a labeled corpus | Built; seed corpus is still small |
 | Surrogate translation | Interface stub only |
 
 ## Build
 
-Go 1.27.1 or later. The only dependency outside the standard library is `modernc.org/sqlite`, a pure-Go SQLite engine, so the binary builds without cgo and cross-compiles for macOS, Linux and Windows.
+Go 1.27.1 or later. The dependencies outside the standard library are pure Go: `modernc.org/sqlite` for the metrics store, and `google.golang.org/grpc` with Envoy's `go-control-plane` types for the Google Agent Gateway extension. The binary builds without cgo and cross-compiles for macOS, Linux and Windows.
 
 ```sh
 go build -o swarmsheriff .
@@ -67,9 +69,23 @@ Then point agents at it, with the upstream host as the first path segment:
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8788/api.anthropic.com
 export OPENAI_BASE_URL=http://127.0.0.1:8788/api.openai.com/v1
+export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8788/generativelanguage.googleapis.com
 ```
 
+Gemini requests may carry the API key in a `?key=` query parameter; it is forwarded upstream and never logged. A blocked Gemini request gets a 403 in Google's own error shape (`PERMISSION_DENIED`), so the Gemini SDKs and Gemini CLI show the reason. Gemini CLI uses the base URL only with API-key auth, not with "Login with Google".
+
 Optional request headers, stripped before forwarding: `X-Swarmsheriff-Labels` (comma-separated source labels), `X-Swarmsheriff-Agent` (declared agent ID) and `X-Swarmsheriff-Credential` (a SwarmSentinel agent credential, resolved to an engine-issued identity when `-sentinel` is set).
+
+## Google Agent Gateway
+
+Agents running on Google Cloud reach models, APIs and MCP servers through Agent Gateway. swarmsheriff can sit behind it as a custom authorization extension, so the same policy file governs those agents too:
+
+```sh
+./swarmsheriff -policy policy.json -gateway-listen 10.0.0.5:443 \
+  -gateway-cert server.pem -gateway-key server-key.pem
+```
+
+The gateway streams each request to swarmsheriff (Envoy `ext_proc`, `CONTENT_AUTHZ` profile). swarmsheriff reads the whole body, decides, and either hands it back unchanged or answers with a 403. Report mode applies here too. See [docs/gcp-agent-gateway.md](docs/gcp-agent-gateway.md) for the extension and authorization policy resources and the known limits.
 
 ## Metrics, hooks and dashboard
 
@@ -80,6 +96,7 @@ Optional request headers, stripped before forwarding: `X-Swarmsheriff-Labels` (c
 
 ./swarmsheriff hook --list-agents
 ./swarmsheriff hook --print-config claude-code
+./swarmsheriff hook --print-config gemini-cli
 
 ./swarmsheriff dashboard --listen 127.0.0.1:9090
 ```
@@ -101,6 +118,7 @@ The running collector also serves the dashboard on `127.0.0.1:9090` by default; 
 | `-metrics=true` | Body-free metrics in SQLite, 30-day retention by default |
 | `-sentinel URL -sentinel-secret-file f` | Link to SwarmSentinel |
 | `-require-credential` | Refuse proxy requests without an engine-issued credential |
+| `-gateway-listen ADDR -gateway-cert f -gateway-key f` | Google Agent Gateway extension over TLS (not loopback) |
 
 All behavior-affecting flags appear in the `swarmsheriff started` log line.
 
@@ -126,7 +144,7 @@ swarmsheriff is careful not to become the data store it exists to protect.
 - API keys and authorization headers pass through to the upstream and are never logged.
 - The metrics database holds kinds, labels, counts, timings and token counts only. No prompts, responses, command lines or file contents.
 - Hook integration forwards event names, opaque IDs and a model name, nothing else.
-- Every listener binds to loopback only. Log and database files are created readable by the owner only.
+- Every listener binds to loopback only, except the opt-in Agent Gateway extension, which requires TLS. Log and database files are created readable by the owner only.
 - Browser watching records the host of a tab, never the path or query.
 
 ## Platforms
@@ -138,6 +156,7 @@ Clipboard reads use `pbpaste` on macOS, PowerShell `Get-Clipboard` on Windows, a
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): components, endpoints, storage, trust boundaries and failure behavior
 - [docs/CAPABILITIES.md](docs/CAPABILITIES.md): plain-language overview of what is built today
 - [docs/ROADMAP.md](docs/ROADMAP.md): the phased plan through enforcement and hardening
+- [docs/gcp-agent-gateway.md](docs/gcp-agent-gateway.md): running swarmsheriff as a Google Agent Gateway authorization extension
 - [policy.example.json](policy.example.json): an example policy with sample classes
 
 ## Author

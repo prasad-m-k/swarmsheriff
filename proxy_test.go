@@ -307,3 +307,100 @@ func TestTokenCaptureSplitAcrossChunks(t *testing.T) {
 		t.Error("recorded a token event with no usage field")
 	}
 }
+
+func TestProxyGeminiStreamModelAndUsage(t *testing.T) {
+	// Gemini puts the model in the path and the key in the query, and repeats a
+	// running usageMetadata in every SSE chunk; thinking is billed as output.
+	var gotPath, gotQuery string
+	p, _, host := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.Path, r.URL.RawQuery
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"candidates":[{"content":{"parts":[{"text":"hi"}]}}],"usageMetadata":{"promptTokenCount":640,"candidatesTokenCount":3,"totalTokenCount":643}}`+"\n\n")
+		w.(http.Flusher).Flush()
+		fmt.Fprint(w, `data: {"candidates":[{"content":{"parts":[{"text":"there"}]}}],"usageMetadata":{"promptTokenCount":640,"candidatesTokenCount":41,"thoughtsTokenCount":200,"totalTokenCount":881,"promptTokensDetails":[{"modality":"TEXT","tokenCount":640}]}}`+"\n\n")
+	}), "", nil)
+	rec := &captureRecorder{}
+	p.rec = rec
+	front := httptest.NewServer(p)
+	defer front.Close()
+	resp, err := http.Post(front.URL+"/"+host+"/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse&key=AIzaFAKEFAKE",
+		"application/json", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if gotPath != "/v1beta/models/gemini-2.5-pro:streamGenerateContent" || gotQuery != "alt=sse&key=AIzaFAKEFAKE" {
+		t.Errorf("upstream path=%q query=%q", gotPath, gotQuery)
+	}
+	var tok, dec *metricEvent
+	for i := 0; i < 50 && tok == nil; i++ {
+		for j := range rec.events {
+			switch rec.events[j].Kind {
+			case kindTokenUsage:
+				tok = &rec.events[j]
+			case kindDecision:
+				dec = &rec.events[j]
+			}
+		}
+		if tok == nil {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if tok == nil || dec == nil {
+		t.Fatalf("events = %+v", rec.events)
+	}
+	if tok.InTokens != 640 || tok.OutTokens != 241 || tok.Model != "gemini-2.5-pro" || dec.Model != "gemini-2.5-pro" {
+		t.Errorf("token event = %+v, decision model = %q", tok, dec.Model)
+	}
+}
+
+func TestProxyGeminiBlockShape(t *testing.T) {
+	p, _, _ := newTestProxy(t, http.NotFoundHandler(), modeEnforce, nil)
+	body := `{"contents":[{"role":"user","parts":[{"text":"Plan for ProjectX"}]}]}`
+	w := post(p, "/generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent", body, nil)
+	var resp struct {
+		Error struct {
+			Code            int
+			Message, Status string
+		}
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != http.StatusForbidden || resp.Error.Code != 403 || resp.Error.Status != "PERMISSION_DENIED" ||
+		!strings.Contains(resp.Error.Message, "swarmsheriff") || strings.Contains(w.Body.String(), "Plan for") {
+		t.Errorf("status %d body %s", w.Code, w.Body)
+	}
+	// Other hosts keep the shared Anthropic/OpenAI shape.
+	w = post(p, "/api.anthropic.com/v1/messages", `{"messages":[{"content":"ProjectX"}]}`, nil)
+	if !strings.Contains(w.Body.String(), `"type":"permission_error"`) {
+		t.Errorf("anthropic body %s", w.Body)
+	}
+}
+
+func TestProxyUpstreamErrorHidesQueryKey(t *testing.T) {
+	p, logs, _ := newTestProxy(t, http.NotFoundHandler(), "", nil)
+	p.transport = http.DefaultTransport
+	p.scheme = "http"
+	w := post(p, "/127.0.0.1:1/v1beta/models/gemini-2.5-flash:generateContent?key=AIzaFAKEFAKE", `{"contents":[]}`, nil)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status %d", w.Code)
+	}
+	if !strings.Contains(logs.String(), "upstream failed") || strings.Contains(logs.String(), "AIzaFAKEFAKE") {
+		t.Errorf("log = %s", logs)
+	}
+}
+
+func TestPathModel(t *testing.T) {
+	for path, want := range map[string]string{
+		"v1beta/models/gemini-2.5-pro:generateContent":                                                        "gemini-2.5-pro",
+		"v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.5-flash:streamGenerateContent": "gemini-2.5-flash",
+		"v1/messages": "",
+		"v1beta/models/bad model:generateContent": "",
+	} {
+		if got := pathModel(path); got != want {
+			t.Errorf("pathModel(%q) = %q, want %q", path, got, want)
+		}
+	}
+}

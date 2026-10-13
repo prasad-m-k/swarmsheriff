@@ -4,7 +4,7 @@
   "destinations": {
     "approved-tenant": ["api.company-llm.example"],
     "consumer-chat": ["chatgpt.com", "claude.ai", "gemini.google.com"],
-    "public-api": ["api.openai.com", "api.anthropic.com", "openrouter.ai"]
+    "public-api": ["api.openai.com", "api.anthropic.com", "generativelanguage.googleapis.com", "aiplatform.googleapis.com", "openrouter.ai"]
   },
   "classes": [
     {
@@ -37,7 +37,7 @@
       "description": "Secrets that grant access: API keys, tokens, private keys",
       "owner": "security",
       "detectors": {
-        "rules": ["private-key", "aws-access-key", "gcp-api-key", "openai-key", "anthropic-key", "github-token", "slack-token", "jwt"]
+        "rules": ["private-key", "aws-access-key", "gcp-api-key", "google-oauth-token", "openai-key", "anthropic-key", "github-token", "slack-token", "jwt"]
       },
       "classifier": {
         "enabled": false

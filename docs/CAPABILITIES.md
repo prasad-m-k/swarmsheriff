@@ -13,7 +13,7 @@ Employees now use AI coding agents (Claude Code, Antigravity, Cursor, Codex and 
 ## What swarmsheriff sees today
 
 - **AI tools and agents in use.** swarmsheriff scans the process list against a catalog of known AI desktop apps and coding agents (Claude Code, Antigravity, Codex, Gemini CLI, Aider, opencode, Goose, Amp, Crush, Cline, Roo Code, Cursor, Windsurf, local model runners, and more), and reports which are running now, when they started and stopped, how long they ran, and their CPU and memory. The dashboard shows this as a live inventory of agents on the machine. Which AI websites are open in the browser is tracked too.
-- **Agent activity, in depth.** For agents that support it (Claude Code and Antigravity today, via their own hook systems), swarmsheriff measures how long each agent spends working, blocked waiting on a human, idle, or in error; how many turns it runs; how long people take to respond to it; and where it stalls. This is the same class of operational metric a mature agent platform tracks about itself.
+- **Agent activity, in depth.** For agents that support it (Claude Code, Antigravity and Gemini CLI today, via their own hook systems), swarmsheriff measures how long each agent spends working, blocked waiting on a human, idle, or in error; how many turns it runs; how long people take to respond to it; and where it stalls. This is the same class of operational metric a mature agent platform tracks about itself.
 - **LLM requests and token usage.** When agents are pointed through swarmsheriff, it sees every request to an LLM API: which model, which provider, which agent, and whether the content matches a company data class. It records the decision, how long the decision took, and the token usage (input and output) read from the response. Token data covers proxied requests only.
 - **Sensitive data on the move.** It scans the clipboard and submitted text for secrets (API keys, private keys, tokens), personal data (card numbers, national IDs, emails), and company-defined markers such as project codenames or confidentiality labels.
 - **Resource cost.** CPU and memory used by each AI tool, and by swarmsheriff itself, so the overhead of both is visible.
@@ -50,17 +50,19 @@ These rules keep swarmsheriff from becoming the very data store it is meant to p
 
 | Channel | What swarmsheriff does today |
 | --- | --- |
-| Claude Code, Antigravity | Full lifecycle metrics through each tool's native hooks |
+| Claude Code, Antigravity, Gemini CLI | Full lifecycle metrics through each tool's native hooks |
 | CLI and SDK agents pointed at the proxy | Per-request classification and decision |
 | Desktop AI apps and CLI agents (ChatGPT, Cursor, Codex, opencode, local models, and more) | Detected from the process list and measured: presence, run time, CPU, memory, process count |
 | Clipboard | Scanned on every copy; can optionally replace a sensitive copy with a notice |
 | Browser AI sites | The open site is detected; content in the page is not yet inspected |
+| Agents on Google Cloud behind Agent Gateway | swarmsheriff runs as a custom authorization extension: the gateway sends each request to it and it allows or blocks by the same data classes |
+| Antigravity signed in with Google | Activity metrics and inventory only; its model traffic goes straight to Google and cannot be inspected locally |
 
-Detection is process-level. An agent that runs only as an editor extension with no distinct process of its own, or one swarmsheriff has no signature for, will not appear in the inventory until network-level and session-log signals are added in a later phase. Deep per-agent metrics (turns, blocked time, operator waits) need that agent's hooks or session logs; today that is Claude Code and Antigravity.
+Detection is process-level. An agent that runs only as an editor extension with no distinct process of its own, or one swarmsheriff has no signature for, will not appear in the inventory until network-level and session-log signals are added in a later phase. Deep per-agent metrics (turns, blocked time, operator waits) need that agent's hooks or session logs; today that is Claude Code, Antigravity and Gemini CLI.
 
 ## Deployment shape
 
-swarmsheriff is a single binary with one dependency (a pure-Go SQLite engine), so it cross-compiles for macOS, Windows, and Linux and deploys as one file. It runs as the user today. Running it as a managed system service, forcing agent traffic through it, and a force-installed browser extension are deployment steps that come with the enforcement phase.
+swarmsheriff is a single binary whose dependencies are pure Go (an SQLite engine, and gRPC with Envoy's protocol types for the Google Agent Gateway extension), so it cross-compiles for macOS, Windows, and Linux and deploys as one file. It runs as the user today. Running it as a managed system service, forcing agent traffic through it, and a force-installed browser extension are deployment steps that come with the enforcement phase.
 
 ## Where it is going
 

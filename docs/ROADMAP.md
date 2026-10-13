@@ -10,8 +10,9 @@ Dates are not fixed. "Done" means built and tested in this repo, not released.
 | --- | --- |
 | 1: See | Clipboard, process, and Chrome-tab watching; DLP scan for secrets, PII, and company keywords; rotating log |
 | 1: Decide | JSON policy of data classes and destinations; the decision pipeline (labels, fingerprints, patterns, classifier); loopback LLM reverse proxy in report or enforce mode; Jev classifier behind a vendor-neutral interface; `-eval` against a labeled corpus |
-| 1.1: Measure | Body-free metrics in local SQLite; agent lifecycle metrics from Claude Code and Antigravity hooks (time in state, blocked time, turns, operator waits, errors, stalls); launch stats; CPU and memory per AI app; `swarmsheriff metrics query/export/clear` |
+| 1.1: Measure | Body-free metrics in local SQLite; agent lifecycle metrics from Claude Code, Antigravity and Gemini CLI hooks (time in state, blocked time, turns, operator waits, errors, stalls); launch stats; CPU and memory per AI app; `swarmsheriff metrics query/export/clear` |
 | 1.1: Extend | Declarative hook adapters: add a new agent by dropping a JSON file in the adapters directory, no recompile (`swarmsheriff hook --list-agents`, `--print-config <agent>`) |
+| 2: Google side | Gemini and Vertex AI through the proxy; Gemini CLI hooks; Antigravity CLI (`agy`) detection and `SessionStart`; a Google Agent Gateway CONTENT_AUTHZ authorization extension (`-gateway-listen`) so the same policy governs agents on Google Cloud |
 | 2: Show | Local web dashboard (`swarmsheriff dashboard`, default `127.0.0.1:9090`) over the metrics database: agent inventory with running-now status, activity timeline, data-protection decisions, resource use |
 
 ## Next: deeper capture at the OS level

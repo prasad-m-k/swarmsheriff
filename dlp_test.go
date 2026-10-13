@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // Card numbers below are public network test numbers (Visa 4111..., Amex
 // 3782..., Mastercard 5555...), never real cards.
@@ -38,6 +41,45 @@ func TestCreditCardDetection(t *testing.T) {
 		}
 		if got != tt.want {
 			t.Errorf("%q: credit-card count = %d, want %d", tt.in, got, tt.want)
+		}
+	}
+}
+
+// Tokens are built from the documented prefixes plus filler, never real values.
+func TestGoogleOAuthTokenRule(t *testing.T) {
+	filler := strings.Repeat("Ab3_-", 8)
+	tests := []struct {
+		in   string
+		want int
+	}{
+		{"Authorization: Bearer ya29." + filler, 1},
+		{`{"refresh_token": "1//0` + filler + `"}`, 1},
+		{"ya29.short", 0},
+		{"see http://example.com/1//0abc", 0},
+		{"version 1.29.3", 0},
+	}
+	s := newDLPScanner(nil)
+	for _, tt := range tests {
+		got := 0
+		for _, f := range s.scan(tt.in) {
+			if f.rule == "google-oauth-token" {
+				got = f.count
+			}
+		}
+		if got != tt.want {
+			t.Errorf("%q: google-oauth-token count = %d, want %d", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestAntigravityCLIDetected(t *testing.T) {
+	for exe, want := range map[string]string{
+		"/Users/x/.local/bin/agy":                               "Antigravity CLI",
+		"/Applications/Antigravity.app/Contents/MacOS/Electron": "Antigravity",
+		"/usr/local/bin/gemini":                                 "Gemini CLI",
+	} {
+		if got, ok := matchAIApp(process{exe: exe}); !ok || got != want {
+			t.Errorf("%s: got %q %v, want %q", exe, got, ok, want)
 		}
 	}
 }

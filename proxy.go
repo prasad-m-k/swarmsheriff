@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"regexp"
 	"slices"
 	"strconv"
@@ -26,6 +27,7 @@ import (
 //
 //	ANTHROPIC_BASE_URL=http://127.0.0.1:8788/api.anthropic.com
 //	OPENAI_BASE_URL=http://127.0.0.1:8788/api.openai.com/v1
+//	GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8788/generativelanguage.googleapis.com
 //
 // It does no TLS interception: the agent talks plain HTTP to loopback and the
 // proxy opens its own HTTPS connection upstream.
@@ -97,7 +99,7 @@ func (p *llmProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if h, _, err := net.SplitHostPort(host); (err == nil && isLoopback(h)) || isLoopback(host) {
 		if !p.allowLoopback {
-			writeProxyError(w, http.StatusForbidden, "permission_error", "swarmsheriff: loopback upstreams are not allowed")
+			writeHostError(w, host, http.StatusForbidden, "permission_error", "swarmsheriff: loopback upstreams are not allowed")
 			return
 		}
 	}
@@ -107,63 +109,20 @@ func (p *llmProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
-			writeProxyError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+			writeHostError(w, host, http.StatusRequestEntityTooLarge, "request_too_large",
 				fmt.Sprintf("swarmsheriff: request body over the %d byte scan limit", p.maxBody))
 			return
 		}
-		writeProxyError(w, http.StatusBadRequest, "invalid_request_error", "swarmsheriff: could not read request body")
+		writeHostError(w, host, http.StatusBadRequest, "invalid_request_error", "swarmsheriff: could not read request body")
 		return
 	}
 
-	req := decideRequest{
-		Text:        requestText(body),
-		Labels:      splitList(r.Header.Get(headerLabels)),
-		AgentID:     strings.TrimSpace(r.Header.Get(headerAgent)),
-		Destination: host,
-	}
-	start := time.Now()
-	var ident *sentinelIdentity
-	if credential := strings.TrimSpace(r.Header.Get(headerCredential)); credential != "" && p.sentinel != nil {
-		id, err := p.sentinel.resolve(r.Context(), credential)
-		if err != nil {
-			// Fail closed: the request claims an engine identity nobody could confirm.
-			if !errors.Is(err, errUnknownCredential) {
-				p.logger.Error("sentinel resolve failed", "err", err)
-			}
-			p.refuse(w, host, nil, "identity:unverified", requestModel(body), start,
-				"swarmsheriff: the agent credential could not be verified with SwarmSentinel")
-			return
-		}
-		ident = &id
-	} else if p.requireCredential {
-		p.refuse(w, host, nil, "identity:missing", requestModel(body), start,
-			"swarmsheriff: this proxy requires an engine-issued agent credential ("+headerCredential+")")
+	rl := p.judge(r.Context(), host, rest, r.Header, body)
+	if rl.status != 0 {
+		writeHostError(w, host, rl.status, rl.typ, rl.msg)
 		return
 	}
-	if ident != nil {
-		if ident.Revoked {
-			p.refuse(w, host, ident, "sentinel:revoked", requestModel(body), start,
-				"swarmsheriff: SwarmSentinel has revoked this agent; its model requests are refused")
-			return
-		}
-		// Engine labels only add restrictions, like launcher labels.
-		req.Labels = append(req.Labels, ident.Labels...)
-		req.AgentID, req.AgentIDSource = ident.AgentID, "engine"
-	}
-	d := p.decider.decide(r.Context(), req)
-	if ident != nil {
-		d.SessionID, d.TaskID = ident.SessionID, ident.TaskID
-	}
-	ev := Event{Time: time.Now(), Decision: d, Model: requestModel(body)}
-	if err := p.sink.Emit(ev); err != nil {
-		p.logger.Error("event sink failed", "err", err)
-	}
-	p.rec.Record(decisionEvent(ev, ev.Time.Sub(start)))
-
-	if d.enforced() {
-		writeProxyError(w, http.StatusForbidden, "permission_error", blockMessage(d))
-		return
-	}
+	d := rl.d
 
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -183,24 +142,101 @@ func (p *llmProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ModifyResponse: func(resp *http.Response) error {
 			// Read the usage field as the body streams past, storing only the
 			// token counts. The body is not buffered and content is not kept.
-			tc := &tokenCapture{rec: p.rec, model: ev.Model, provider: d.Destination,
+			tc := &tokenCapture{rec: p.rec, model: rl.model, provider: d.Destination,
 				dest: d.Destination, agentID: d.AgentID}
 			resp.Body = &teeReadCloser{rc: resp.Body, tee: io.TeeReader(resp.Body, tc), done: tc.record}
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if r.Context().Err() == nil {
+				// A *url.Error prints the full URL, and Gemini clients may put
+				// the API key in its query (?key=), so log only the cause.
+				var ue *url.Error
+				if errors.As(err, &ue) {
+					err = ue.Err
+				}
 				p.logger.Error("upstream failed", "dest", host, "err", err)
 			}
-			writeProxyError(w, http.StatusBadGateway, "api_error", "swarmsheriff: upstream request failed")
+			writeHostError(w, host, http.StatusBadGateway, "api_error", "swarmsheriff: upstream request failed")
 		},
 	}
 	rp.ServeHTTP(w, r)
 }
 
+// ruling is what the proxy or the gateway extension does with one request:
+// forward it (status 0) or answer with an error. The decision has already
+// been sent to the sink and the recorder.
+type ruling struct {
+	d        Decision
+	model    string
+	status   int
+	typ, msg string
+}
+
+// judge resolves the agent's identity, runs the decision pipeline over one
+// request body and records the decision. hdr supplies the optional
+// X-Swarmsheriff-* headers; the caller strips them before forwarding.
+func (p *llmProxy) judge(ctx context.Context, host, path string, hdr http.Header, body []byte) ruling {
+	// Gemini names the model in the path (models/gemini-2.5-pro:generateContent),
+	// the others in the body.
+	model := requestModel(body)
+	if model == "" {
+		model = pathModel(path)
+	}
+	req := decideRequest{
+		Text:        requestText(body),
+		Labels:      splitList(hdr.Get(headerLabels)),
+		AgentID:     strings.TrimSpace(hdr.Get(headerAgent)),
+		Destination: host,
+	}
+	start := time.Now()
+	var ident *sentinelIdentity
+	if credential := strings.TrimSpace(hdr.Get(headerCredential)); credential != "" && p.sentinel != nil {
+		id, err := p.sentinel.resolve(ctx, credential)
+		if err != nil {
+			// Fail closed: the request claims an engine identity nobody could confirm.
+			if !errors.Is(err, errUnknownCredential) {
+				p.logger.Error("sentinel resolve failed", "err", err)
+			}
+			return p.refuse(host, nil, "identity:unverified", model, start,
+				"swarmsheriff: the agent credential could not be verified with SwarmSentinel")
+		}
+		ident = &id
+	} else if p.requireCredential {
+		return p.refuse(host, nil, "identity:missing", model, start,
+			"swarmsheriff: this proxy requires an engine-issued agent credential ("+headerCredential+")")
+	}
+	if ident != nil {
+		if ident.Revoked {
+			return p.refuse(host, ident, "sentinel:revoked", model, start,
+				"swarmsheriff: SwarmSentinel has revoked this agent; its model requests are refused")
+		}
+		// Engine labels only add restrictions, like launcher labels.
+		req.Labels = append(req.Labels, ident.Labels...)
+		req.AgentID, req.AgentIDSource = ident.AgentID, "engine"
+	}
+	d := p.decider.decide(ctx, req)
+	if ident != nil {
+		d.SessionID, d.TaskID = ident.SessionID, ident.TaskID
+	}
+	p.emit(d, model, start)
+	if d.enforced() {
+		return ruling{d: d, model: model, status: http.StatusForbidden, typ: "permission_error", msg: blockMessage(d)}
+	}
+	return ruling{d: d, model: model}
+}
+
+func (p *llmProxy) emit(d Decision, model string, start time.Time) {
+	ev := Event{Time: time.Now(), Decision: d, Model: model}
+	if err := p.sink.Emit(ev); err != nil {
+		p.logger.Error("event sink failed", "err", err)
+	}
+	p.rec.Record(decisionEvent(ev, ev.Time.Sub(start)))
+}
+
 // refuse blocks a request before classification, for identity and revocation
 // failures, and records the decision like any other.
-func (p *llmProxy) refuse(w http.ResponseWriter, host string, ident *sentinelIdentity, rule, model string, start time.Time, msg string) {
+func (p *llmProxy) refuse(host string, ident *sentinelIdentity, rule, model string, start time.Time, msg string) ruling {
 	cat, ok := p.decider.policy.Load().category(host)
 	if !ok {
 		cat = categoryUnlisted
@@ -210,12 +246,8 @@ func (p *llmProxy) refuse(w http.ResponseWriter, host string, ident *sentinelIde
 	if ident != nil {
 		d.AgentID, d.AgentIDSource, d.SessionID, d.TaskID = ident.AgentID, "engine", ident.SessionID, ident.TaskID
 	}
-	ev := Event{Time: time.Now(), Decision: d, Model: model}
-	if err := p.sink.Emit(ev); err != nil {
-		p.logger.Error("event sink failed", "err", err)
-	}
-	p.rec.Record(decisionEvent(ev, ev.Time.Sub(start)))
-	writeProxyError(w, http.StatusForbidden, "permission_error", msg)
+	p.emit(d, model, start)
+	return ruling{d: d, model: model, status: http.StatusForbidden, typ: "permission_error", msg: msg}
 }
 
 // blockMessage tells the user what happened and how to ask for an exception,
@@ -239,12 +271,38 @@ func blockMessage(d Decision) string {
 // writeProxyError writes an error body both the Anthropic and OpenAI SDKs can
 // read: each looks for error.message and error.type.
 func writeProxyError(w http.ResponseWriter, status int, typ, msg string) {
+	writeHostError(w, "", status, typ, msg)
+}
+
+// writeHostError writes the error in the shape the upstream's own SDK reads.
+func writeHostError(w http.ResponseWriter, host string, status int, typ, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]any{
-		"type":  "error",
-		"error": map[string]string{"type": typ, "message": msg},
-	})
+	w.Write(errorBody(host, status, typ, msg))
+}
+
+// errorBody is the JSON error for a host. Google's Gemini and Vertex SDKs
+// look for error.status and error.message in
+// {"error":{"code":403,"message":"...","status":"PERMISSION_DENIED"}}; every
+// other host gets the shared Anthropic/OpenAI shape.
+func errorBody(host string, status int, typ, msg string) []byte {
+	var v any = map[string]any{"type": "error", "error": map[string]string{"type": typ, "message": msg}}
+	if providerFor(host) == "google" {
+		code := "INTERNAL"
+		switch status {
+		case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
+			code = "INVALID_ARGUMENT"
+		case http.StatusForbidden:
+			code = "PERMISSION_DENIED"
+		case http.StatusNotFound:
+			code = "NOT_FOUND"
+		case http.StatusBadGateway:
+			code = "UNAVAILABLE"
+		}
+		v = map[string]any{"error": map[string]any{"code": status, "message": msg, "status": code}}
+	}
+	b, _ := json.Marshal(v)
+	return append(b, '\n')
 }
 
 // requestText returns the text an LLM request carries. For JSON it joins every
@@ -319,11 +377,26 @@ func (t *teeReadCloser) Close() error {
 // usageTokens pulls the first input/prompt token count and the last
 // output/completion token count out of an LLM response, so it works for both
 // a single JSON body and an SSE stream (Anthropic reports output_tokens again
-// in the final message_delta; OpenAI in the final chunk).
+// in the final message_delta; OpenAI in the final chunk; Gemini repeats a
+// running usageMetadata in every chunk). Gemini counts thinking separately
+// from candidatesTokenCount but bills it as output, so it is added on.
 var (
-	reInTokens  = regexp.MustCompile(`"(?:input_tokens|prompt_tokens)"\s*:\s*(\d+)`)
-	reOutTokens = regexp.MustCompile(`"(?:output_tokens|completion_tokens)"\s*:\s*(\d+)`)
+	reInTokens      = regexp.MustCompile(`"(?:input_tokens|prompt_tokens|promptTokenCount)"\s*:\s*(\d+)`)
+	reOutTokens     = regexp.MustCompile(`"(?:output_tokens|completion_tokens|candidatesTokenCount)"\s*:\s*(\d+)`)
+	reThoughtTokens = regexp.MustCompile(`"thoughtsTokenCount"\s*:\s*(\d+)`)
 )
+
+// pathModel reads the model from a Gemini or Vertex AI path such as
+// v1beta/models/gemini-2.5-pro:streamGenerateContent.
+var rePathModel = regexp.MustCompile(`(?:^|/)models/([^/:?]+):`)
+
+func pathModel(path string) string {
+	m := rePathModel.FindStringSubmatch(path)
+	if m == nil {
+		return ""
+	}
+	return cleanModel(m[1])
+}
 
 // tokenCapture scans a response body incrementally for the usage field. It
 // keeps a small tail so a count split across two chunks is still found, and
@@ -332,7 +405,7 @@ type tokenCapture struct {
 	rec                            recorder
 	model, provider, dest, agentID string
 	tail                           []byte
-	inTokens, outTokens            int64
+	inTokens, outTokens, thoughts  int64
 	haveIn, haveOut                bool
 }
 
@@ -354,6 +427,10 @@ func (t *tokenCapture) Write(p []byte) (int, error) {
 		t.outTokens, _ = strconv.ParseInt(string(m[len(m)-1][1]), 10, 64)
 		t.haveOut = true
 	}
+	if m := reThoughtTokens.FindAllSubmatch(buf, -1); m != nil {
+		t.thoughts, _ = strconv.ParseInt(string(m[len(m)-1][1]), 10, 64)
+		t.haveOut = true
+	}
 	if n := len(buf); n > tokenScanOverlap {
 		t.tail = append(t.tail[:0], buf[n-tokenScanOverlap:]...)
 	} else {
@@ -367,5 +444,5 @@ func (t *tokenCapture) record() {
 		return // not an LLM response with a usage field
 	}
 	t.rec.Record(metricEvent{Kind: kindTokenUsage, Model: t.model, Provider: providerFor(t.provider),
-		Dest: t.dest, AgentID: t.agentID, InTokens: t.inTokens, OutTokens: t.outTokens})
+		Dest: t.dest, AgentID: t.agentID, InTokens: t.inTokens, OutTokens: t.outTokens + t.thoughts})
 }

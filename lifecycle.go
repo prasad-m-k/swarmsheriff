@@ -43,6 +43,7 @@ const (
 	kindAgentObservation  = "agent_observation"
 	hookAgentKindClaude   = "claude-code"
 	hookAgentKindAntigrav = "antigravity"
+	hookAgentKindGemini   = "gemini-cli"
 	hookToolAskUser       = "ask_user_question"
 	hookToolExitPlan      = "exit_plan_mode"
 	hookToolOther         = "other"
@@ -176,6 +177,8 @@ func mapAgentPayload(agent, event string, obj map[string]any, now time.Time) (ho
 		return mapHookPayload(event, obj, now)
 	case hookAgentKindAntigrav:
 		return mapAntigravityPayload(event, obj, now)
+	case hookAgentKindGemini:
+		return mapGeminiPayload(event, obj, now)
 	default:
 		if a := customAdapters[agent]; a != nil {
 			return mapWithAdapter(a, event, obj, now.UnixMilli())
@@ -201,7 +204,7 @@ func loadCustomAdapters(dir string) []error {
 // knownAgents lists every agent that can be hooked: the built-ins plus any
 // loaded custom adapters.
 func knownAgents() []string {
-	out := []string{hookAgentKindClaude, hookAgentKindAntigrav}
+	out := []string{hookAgentKindClaude, hookAgentKindAntigrav, hookAgentKindGemini}
 	for name := range customAdapters {
 		out = append(out, name)
 	}
@@ -209,15 +212,61 @@ func knownAgents() []string {
 	return out
 }
 
-// mapAntigravityPayload turns a Google Antigravity hook payload into a
-// hookEvent. Antigravity has no session start/end event, so the session is
-// keyed on conversationId and first-seen marks it. toolCall.args,
+func isBuiltinAgent(name string) bool {
+	return name == hookAgentKindClaude || name == hookAgentKindAntigrav || name == hookAgentKindGemini
+}
+
+// mapGeminiPayload turns a Gemini CLI hook payload into a hookEvent. Gemini
+// CLI sends session_id on every event but no turn or tool-call ID, so tool
+// events cannot be paired and all count as plain tool activity. prompt,
+// prompt_response, llm_request messages, tool_input, tool_response and
+// transcript_path are content or paths and are never read; only the model
+// name is taken out of llm_request (a request over hookMaxPayload is dropped
+// whole). AfterModel is not mapped: it can fire per
+// streamed chunk and adds nothing BeforeModel does not.
+func mapGeminiPayload(event string, obj map[string]any, now time.Time) (hookEvent, bool) {
+	if event == "" {
+		event, _ = obj["hook_event_name"].(string)
+	}
+	e := hookEvent{AgentKind: hookAgentKindGemini, SessionID: opaqueID(obj["session_id"]), AtMs: now.UnixMilli()}
+	switch strings.ToLower(strings.ReplaceAll(event, "-", "")) {
+	case "sessionstart":
+		e.Kind = kindSessionStarted
+	case "sessionend":
+		e.Kind = kindSessionEnded
+	case "beforeagent":
+		e.Kind = kindTurnStarted
+	case "afteragent":
+		e.Kind = kindTurnCompleted
+	case "beforemodel":
+		req, _ := obj["llm_request"].(map[string]any)
+		e.Kind, e.Model = kindAgentObservation, cleanModel(req["model"])
+	case "beforetool", "aftertool":
+		e.Kind, e.ToolClass = kindToolActivity, hookToolOther
+	case "notification":
+		if t, _ := obj["notification_type"].(string); t == "ToolPermission" {
+			e.Kind = kindApprovalRequested
+		} else {
+			e.Kind = kindAgentObservation
+		}
+	default:
+		return e, false
+	}
+	return e, true
+}
+
+// mapAntigravityPayload turns a Google Antigravity hook payload (IDE, 2.0
+// desktop and the agy CLI share it) into a hookEvent. Sessions are keyed on
+// conversationId; SessionStart marks a start where the build sends it, and
+// otherwise first-seen does. There is no session end event. toolCall.args,
 // transcriptPath, workspacePaths and the artifact directory are content or
 // paths and are never read. modelName rides on every event.
 func mapAntigravityPayload(event string, obj map[string]any, now time.Time) (hookEvent, bool) {
 	e := hookEvent{AgentKind: hookAgentKindAntigrav, SessionID: opaqueID(obj["conversationId"]),
 		Model: cleanModel(obj["modelName"]), AtMs: now.UnixMilli()}
 	switch strings.ToLower(strings.ReplaceAll(event, "-", "")) {
+	case "sessionstart":
+		e.Kind = kindSessionStarted
 	case "preinvocation":
 		e.Kind = kindTurnStarted
 	case "postinvocation":
@@ -267,7 +316,7 @@ func runHookCLI(args []string, stdin io.Reader, now time.Time) int {
 			event = args[i]
 		}
 	}
-	if agent != hookAgentKindClaude && agent != hookAgentKindAntigrav {
+	if !isBuiltinAgent(agent) {
 		loadCustomAdapters(adaptersDir) // errors ignored: the hook must stay silent and never fail the agent
 	}
 	var obj map[string]any
@@ -428,7 +477,9 @@ func requestModel(body []byte) string {
 func hookConfigDest(agent string) string {
 	switch agent {
 	case hookAgentKindAntigrav:
-		return "Antigravity: write to a workspace .agents/hooks.json or the global ~/.gemini/config/hooks.json"
+		return "Antigravity (IDE, desktop and agy CLI): write to a workspace .agents/hooks.json or the global ~/.gemini/config/hooks.json"
+	case hookAgentKindGemini:
+		return "Gemini CLI: merge the \"hooks\" object into ~/.gemini/settings.json (or a project .gemini/settings.json)"
 	case "", hookAgentKindClaude:
 		return "Claude Code: merge the \"hooks\" object into ~/.claude/settings.json"
 	default:
@@ -447,6 +498,8 @@ func hooksSnippet(agent, binary string) (string, error) {
 		return claudeHooksSnippet(binary), nil
 	case hookAgentKindAntigrav:
 		return antigravityHooksSnippet(binary), nil
+	case hookAgentKindGemini:
+		return geminiHooksSnippet(binary), nil
 	default:
 		if a := customAdapters[agent]; a != nil {
 			return renderHookConfig(a, binary), nil
@@ -469,13 +522,32 @@ func claudeHooksSnippet(binary string) string {
 	return string(out)
 }
 
+// geminiHooksSnippet is the settings.json fragment for Gemini CLI. Its hook
+// timeout is in milliseconds; tool events take a regex matcher, "*" for all.
+func geminiHooksSnippet(binary string) string {
+	toolEvents := map[string]bool{"BeforeTool": true, "AfterTool": true}
+	hooks := map[string]any{}
+	for _, ev := range []string{"SessionStart", "SessionEnd", "BeforeAgent", "AfterAgent", "BeforeModel",
+		"BeforeTool", "AfterTool", "Notification"} {
+		hook := map[string]any{"name": "swarmsheriff", "type": "command",
+			"command": fmt.Sprintf("%q hook --agent %s %s", binary, hookAgentKindGemini, ev), "timeout": 5000}
+		entry := map[string]any{"hooks": []any{hook}}
+		if toolEvents[ev] {
+			entry["matcher"] = "*"
+		}
+		hooks[ev] = []any{entry}
+	}
+	out, _ := json.MarshalIndent(map[string]any{"hooks": hooks}, "", "  ")
+	return string(out)
+}
+
 // antigravityHooksSnippet is the hooks.json for Google Antigravity. Write it to
 // a workspace .agents/hooks.json or the global ~/.gemini/config/hooks.json.
 // Tool events carry a "*" matcher so every tool is seen.
 func antigravityHooksSnippet(binary string) string {
 	toolEvents := map[string]bool{"PreToolUse": true, "PostToolUse": true}
 	entries := map[string]any{}
-	for _, ev := range []string{"PreInvocation", "PostInvocation", "PreToolUse", "PostToolUse", "Stop"} {
+	for _, ev := range []string{"SessionStart", "PreInvocation", "PostInvocation", "PreToolUse", "PostToolUse", "Stop"} {
 		hook := map[string]any{"type": "command",
 			"command": fmt.Sprintf("%q hook --agent %s %s", binary, hookAgentKindAntigrav, ev), "timeout": 5}
 		entry := map[string]any{"hooks": []any{hook}}

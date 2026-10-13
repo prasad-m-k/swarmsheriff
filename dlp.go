@@ -35,6 +35,9 @@ var builtinRules = []dlpRule{
 	{name: "private-key", re: regexp.MustCompile(`-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----`)},
 	{name: "aws-access-key", re: regexp.MustCompile(`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`)},
 	{name: "gcp-api-key", re: regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{35}\b`)},
+	// Google OAuth access tokens (ya29.) and refresh tokens (1//0), as gcloud,
+	// ADC and the Google SDKs hold them.
+	{name: "google-oauth-token", re: regexp.MustCompile(`\bya29\.[0-9A-Za-z_-]{30,}|\b1//0[0-9A-Za-z_-]{30,}`)},
 	{name: "openai-key", re: regexp.MustCompile(`\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b`)},
 	{name: "anthropic-key", re: regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_-]{20,}\b`)},
 	{name: "github-token", re: regexp.MustCompile(`\bgh[opsu]_[A-Za-z0-9]{36,}\b`)},

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -421,6 +422,7 @@ func TestMapAntigravityPayload(t *testing.T) {
 		event, payload, kind string
 		ok                   bool
 	}{
+		{"SessionStart", `{"conversationId":"c-1","modelName":"gemini-3.6-flash","workspacePaths":["/secret/path"]}`, kindSessionStarted, true},
 		{"PreInvocation", `{"conversationId":"c-1","modelName":"gemini-3.6-flash","invocationNum":1}`, kindTurnStarted, true},
 		{"PreToolUse", `{"conversationId":"c-1","toolCall":{"name":"run_command","args":{"command":"cat SECRET.env"}},"stepIdx":2}`, kindToolActivity, true},
 		{"PostToolUse", `{"conversationId":"c-1","toolCall":{"name":"read_file","args":{"path":"/secret/path"}}}`, kindToolActivity, true},
@@ -482,3 +484,73 @@ func TestAntigravitySessionInMetrics(t *testing.T) {
 }
 
 var _ net.Conn // keep net imported for the socket helpers above
+
+func TestMapGeminiPayload(t *testing.T) {
+	now := metricsBase
+	tests := []struct {
+		event, payload, kind, model string
+		ok                          bool
+	}{
+		{"SessionStart", `{"session_id":"g-1","source":"startup","cwd":"/secret/repo","transcript_path":"/secret/t.json"}`, kindSessionStarted, "", true},
+		{"BeforeAgent", `{"session_id":"g-1","prompt":"summarize SECRET.env"}`, kindTurnStarted, "", true},
+		{"BeforeModel", `{"session_id":"g-1","llm_request":{"model":"gemini-2.5-pro","messages":[{"role":"user","content":"SECRET.env"}]}}`, kindAgentObservation, "gemini-2.5-pro", true},
+		{"BeforeTool", `{"session_id":"g-1","tool_name":"run_shell_command","tool_input":{"command":"cat SECRET.env"}}`, kindToolActivity, "", true},
+		{"AfterTool", `{"session_id":"g-1","tool_name":"read_file","tool_response":{"llmContent":"SECRET.env","error":"overloaded"}}`, kindToolActivity, "", true},
+		{"Notification", `{"session_id":"g-1","notification_type":"ToolPermission","message":"allow SECRET.env?"}`, kindApprovalRequested, "", true},
+		{"AfterAgent", `{"session_id":"g-1","prompt":"x","prompt_response":"SECRET.env","stop_hook_active":false}`, kindTurnCompleted, "", true},
+		{"SessionEnd", `{"session_id":"g-1","reason":"exit"}`, kindSessionEnded, "", true},
+		{"", `{"session_id":"g-1","hook_event_name":"BeforeAgent"}`, kindTurnStarted, "", true},
+		{"AfterModel", `{"session_id":"g-1","llm_response":{}}`, "", "", false},
+		{"PreCompress", `{"session_id":"g-1","trigger":"auto"}`, "", "", false},
+	}
+	for _, tt := range tests {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(tt.payload), &obj); err != nil {
+			t.Fatal(err)
+		}
+		e, ok := mapAgentPayload("gemini-cli", tt.event, obj, now)
+		if ok != tt.ok || (ok && (e.Kind != tt.kind || e.Model != tt.model)) {
+			t.Errorf("%s: kind=%q model=%q ok=%v, want %q %q %v", tt.event, e.Kind, e.Model, ok, tt.kind, tt.model, tt.ok)
+		}
+		if ok && (e.AgentKind != "gemini-cli" || e.SessionID != "g-1") {
+			t.Errorf("%s: agentKind=%q session=%q", tt.event, e.AgentKind, e.SessionID)
+		}
+		out, _ := json.Marshal(e)
+		for _, banned := range []string{"SECRET.env", "/secret", "run_shell_command", "read_file", "overloaded", "summarize"} {
+			if strings.Contains(string(out), banned) {
+				t.Errorf("%s: gemini event carries %q: %s", tt.event, banned, out)
+			}
+		}
+	}
+}
+
+func TestGeminiHooksSnippet(t *testing.T) {
+	var cfg struct {
+		Hooks map[string][]struct {
+			Matcher string `json:"matcher"`
+			Hooks   []struct {
+				Type, Command string
+				Timeout       int
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(geminiHooksSnippet("/usr/local/bin/swarmsheriff")), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range []string{"SessionStart", "SessionEnd", "BeforeAgent", "AfterAgent", "BeforeModel", "BeforeTool", "AfterTool", "Notification"} {
+		h := cfg.Hooks[ev]
+		if len(h) != 1 || len(h[0].Hooks) != 1 || h[0].Hooks[0].Type != "command" || h[0].Hooks[0].Timeout != 5000 ||
+			h[0].Hooks[0].Command != `"/usr/local/bin/swarmsheriff" hook --agent gemini-cli `+ev {
+			t.Errorf("%s: %+v", ev, h)
+		}
+	}
+	if cfg.Hooks["BeforeTool"][0].Matcher != "*" || cfg.Hooks["SessionStart"][0].Matcher != "" {
+		t.Error("matcher only belongs on tool events")
+	}
+	if !slices.Contains(knownAgents(), "gemini-cli") {
+		t.Error("gemini-cli not listed")
+	}
+	if err := (&HookAdapter{Name: "gemini-cli"}).compile(); err == nil {
+		t.Error("built-in name accepted for a custom adapter")
+	}
+}

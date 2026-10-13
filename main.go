@@ -100,7 +100,7 @@ func main() {
 			if pc+1 < len(rest) && !strings.HasPrefix(rest[pc+1], "-") {
 				agent = rest[pc+1]
 			}
-			if agent != hookAgentKindClaude && agent != hookAgentKindAntigrav {
+			if !isBuiltinAgent(agent) {
 				for _, e := range loadCustomAdapters(adaptersDir) {
 					fmt.Fprintln(os.Stderr, "adapter warning:", e)
 				}
@@ -147,6 +147,9 @@ func main() {
 	hookSocket := flag.String("hook-socket", defaultHookSocket(), "Unix socket for agent lifecycle hooks")
 	sentinelURL := flag.String("sentinel", "", "SwarmSentinel engine URL for engine-issued agent identity, confidentiality labels and the decision feed (empty = off)")
 	sentinelSecret := flag.String("sentinel-secret-file", "", "file holding the shared secret for the SwarmSentinel egress endpoints (required with -sentinel)")
+	gatewayAddr := flag.String("gateway-listen", "", "address for the Google Agent Gateway authorization extension (ext_proc over TLS), e.g. 10.0.0.5:443; not loopback-only (empty = disabled)")
+	gatewayCert := flag.String("gateway-cert", "", "TLS certificate file for -gateway-listen")
+	gatewayKey := flag.String("gateway-key", "", "TLS private key file for -gateway-listen")
 	requireCredential := flag.Bool("require-credential", false, "refuse proxy requests without an engine-issued agent credential (needs -sentinel)")
 	dashboardAddr := flag.String("dashboard", "127.0.0.1:9090", "serve the metrics dashboard on this loopback address (empty = off; needs -metrics)")
 	flag.Parse()
@@ -169,8 +172,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error: -clipboard-guard ai needs -ai-interval > 0 to know when AI tools are open")
 		os.Exit(2)
 	}
-	if (*proxyAddr != "" || *evalDir != "") && *policyPath == "" {
-		fmt.Fprintln(os.Stderr, "error: -proxy and -eval need -policy")
+	if (*proxyAddr != "" || *evalDir != "" || *gatewayAddr != "") && *policyPath == "" {
+		fmt.Fprintln(os.Stderr, "error: -proxy, -gateway-listen and -eval need -policy")
+		os.Exit(2)
+	}
+	if *gatewayAddr != "" && (*gatewayCert == "" || *gatewayKey == "") {
+		fmt.Fprintln(os.Stderr, "error: -gateway-listen needs -gateway-cert and -gateway-key")
 		os.Exit(2)
 	}
 	var dec *decider
@@ -258,7 +265,8 @@ func main() {
 		startAttrs = append(startAttrs, "policy", *policyPath, "proxy", *proxyAddr, "proxy_max_mb", *proxyMaxMB,
 			"mode", dec.modeFor(pol, nil), "classifier", dec.classifier.Name(), "classifier_timeout", *classifierTimeout)
 		// The secret file path is logged; the secret itself never is.
-		startAttrs = append(startAttrs, "sentinel", *sentinelURL, "require_credential", *requireCredential)
+		startAttrs = append(startAttrs, "sentinel", *sentinelURL, "require_credential", *requireCredential,
+			"gateway_listen", *gatewayAddr)
 		// Raw content to a hosted classifier is an explicit policy choice; make it visible.
 		if raw := pol.rawClassifierClasses(); len(raw) > 0 && *classifierName != "none" {
 			startAttrs = append(startAttrs, "classifier_raw", strings.Join(raw, ","))
@@ -309,7 +317,7 @@ func main() {
 			}
 		}()
 	}
-	if *proxyAddr != "" {
+	if *proxyAddr != "" || *gatewayAddr != "" {
 		var sink Sink = logSink{logger}
 		var sentinel *sentinelClient
 		if *sentinelURL != "" {
@@ -327,13 +335,30 @@ func main() {
 		p := newLLMProxy(dec, sink, logger, int64(*proxyMaxMB*1024*1024))
 		p.sentinel, p.requireCredential = sentinel, *requireCredential
 		p.rec = rec
-		go func() {
-			if err := startProxy(ctx, *proxyAddr, p); err != nil {
-				logger.Error("proxy failed", "err", err)
-				intakeErrCh <- err
-				stop()
-			}
-		}()
+		if *proxyAddr != "" {
+			go func() {
+				if err := startProxy(ctx, *proxyAddr, p); err != nil {
+					logger.Error("proxy failed", "err", err)
+					select {
+					case intakeErrCh <- err:
+					default:
+					}
+					stop()
+				}
+			}()
+		}
+		if *gatewayAddr != "" {
+			go func() {
+				if err := startGateway(ctx, *gatewayAddr, *gatewayCert, *gatewayKey, p); err != nil {
+					logger.Error("gateway extension failed", "err", err)
+					select {
+					case intakeErrCh <- err:
+					default:
+					}
+					stop()
+				}
+			}()
+		}
 	}
 	var policyTick <-chan time.Time
 	var policyMod time.Time

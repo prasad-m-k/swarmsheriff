@@ -11,7 +11,7 @@ import (
 )
 
 // A hook adapter describes, as data, how one agent tool's hook payload maps to
-// swarmsheriff lifecycle events. The two built-in agents (claude-code, antigravity)
+// swarmsheriff lifecycle events. The built-in agents (claude-code, antigravity, gemini-cli)
 // are hand-written Go in lifecycle.go for their quirks; every other agent is
 // added by dropping a JSON adapter file in the adapters directory, with no
 // recompile. The format below is deliberately small: a field map, an
@@ -79,7 +79,7 @@ func (a *HookAdapter) compile() error {
 	if a.Name == "" {
 		return fmt.Errorf("adapter: field %q is required", "name")
 	}
-	if a.Name == hookAgentKindClaude || a.Name == hookAgentKindAntigrav {
+	if isBuiltinAgent(a.Name) {
 		return fmt.Errorf("adapter %q: name is reserved for a built-in agent", a.Name)
 	}
 	if opaqueID(a.Name) != a.Name {
