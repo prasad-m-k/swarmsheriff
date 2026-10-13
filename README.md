@@ -38,7 +38,7 @@ A local tool stops accidents, not deliberate exfiltration through another device
 Go 1.27.1 or later. The dependencies outside the standard library are pure Go: `modernc.org/sqlite` for the metrics store, and `google.golang.org/grpc` with Envoy's `go-control-plane` types for the Google Agent Gateway extension. The binary builds without cgo and cross-compiles for macOS, Linux and Windows.
 
 ```sh
-go build -o swarmsheriff .
+go build -o swarmsheriff ./cmd/swarmsheriff
 go vet ./...
 go test ./...
 ```

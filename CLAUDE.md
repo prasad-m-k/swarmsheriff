@@ -26,14 +26,14 @@ The project uses the standard library plus these approved dependencies: `modernc
 | Agent lifecycle metrics from Claude Code, Antigravity and Gemini CLI hooks (time in state, blocked time, turns, operator waits, errors, stalls), launch stats, CPU and memory per AI app | Built (phase 1.1) |
 | Declarative hook adapters: add a new agent via a JSON file, no recompile | Built (phase 1.1) |
 | Local web dashboard over the metrics database (`swarmsheriff dashboard`) | Built (phase 2) |
-| Policy file, classes, destination matrix | Built (`policy.go`, `policy.example.json`), reloaded on change |
-| Decision pipeline | Built (`decide.go`) |
-| LLM reverse proxy that can block | Built (`proxy.go`), report mode by default |
-| Classifier interface (Jev behind it) | Built (`classify.go`); Jev client not yet calibrated against live traffic |
-| Decision events | File sink built (`events.go`); asynchronous HTTP sink to SwarmSentinel's recorder built (`sentinel.go`) |
-| SwarmSentinel link: engine-issued agent identity and confidentiality labels | Built (`sentinel.go`, `-sentinel`, `-require-credential`); fails closed on unverifiable credentials and revoked agents |
-| `-eval` against a labeled corpus | Built (`eval.go`); seed corpus is far below the 200 samples per class the exit criteria need |
-| Google Agent Gateway authorization extension (CONTENT_AUTHZ, Envoy ext_proc over TLS) | Built (`gateway.go`, `-gateway-listen`), off by default; tested in-process, not yet against a live gateway |
+| Policy file, classes, destination matrix | Built (`internal/policy`, `policy.example.json`), reloaded on change |
+| Decision pipeline | Built (`internal/decide`) |
+| LLM reverse proxy that can block | Built (`internal/proxy/proxy.go`), report mode by default |
+| Classifier interface (Jev behind it) | Built (`internal/classify`); Jev client not yet calibrated against live traffic |
+| Decision events | File sink built (`internal/events`); asynchronous HTTP sink to SwarmSentinel's recorder built (`internal/sentinel`) |
+| SwarmSentinel link: engine-issued agent identity and confidentiality labels | Built (`internal/sentinel`, `-sentinel`, `-require-credential`); fails closed on unverifiable credentials and revoked agents |
+| `-eval` against a labeled corpus | Built (`internal/eval`); seed corpus is far below the 200 samples per class the exit criteria need |
+| Google Agent Gateway authorization extension (CONTENT_AUTHZ, Envoy ext_proc over TLS) | Built (`internal/proxy/gateway.go`, `-gateway-listen`), off by default; tested in-process, not yet against a live gateway |
 | Gemini and Vertex AI through the proxy (model from the path, `usageMetadata` tokens, Google error shape) | Built |
 | Surrogate translation (DPTP) | Interface stub only |
 | c11 integration (agent identity, sidebar) | Out of scope until phase 3 |
@@ -43,7 +43,7 @@ swarmsheriff can block only requests that agents send through the proxy, and onl
 ## Build and run
 
 ```
-go build -o swarmsheriff .      # binary is gitignored
+go build -o swarmsheriff ./cmd/swarmsheriff      # binary is gitignored
 go vet ./...
 gofmt -l .                 # must print nothing
 go test ./...
@@ -52,7 +52,7 @@ go test ./...
 ./swarmsheriff -listen 127.0.0.1:8787   # token printed to stderr
 ```
 
-`go.mod` declares `go 1.27.1`; the code uses `min`, `slices`, `maps`, and `log/slog`. Tests go in `*_test.go` beside the file under test.
+`go.mod` declares `go 1.27.1`; the code uses `min`, `slices`, `maps`, and `log/slog`. Tests go in `*_test.go` beside the file under test, in the same package.
 
 Enforcement flags (all listed in the `swarmsheriff started` log line):
 
@@ -100,38 +100,36 @@ Optional request headers, stripped before forwarding: `X-Swarmsheriff-Labels` (c
 
 ## Layout
 
-Everything is `package main` in the repo root unless a file says otherwise.
+The binary is `cmd/swarmsheriff`; everything else is a package under `internal/`, one per job. Dependencies point downward in this order: `dlp`, `llm`, `netutil`, `logfile` at the bottom, then `policy`, `classify`, `decide`, `events`, `metrics`, `sentinel`, then `proxy`, `hooks`, `watch`, `clipboard`, `intake`, `dashboard`, `eval`. A test helper used by several packages (the test policy, fake classifier, capture recorder, metrics fixtures) is copied into each package's `helpers_test.go`, because a shared test package would create import cycles.
 
-| File | Responsibility |
+| Path | Responsibility |
 | --- | --- |
-| `main.go` | Flags, clipboard polling loop, `logClipboard`, wiring of the other components |
-| `procwatch.go` | AI app detection from the process list (`aiApps`), grouping helpers, command-line redaction |
-| `browserwatch.go` | AI site detection in Chrome tabs via `osascript` (`aiSites`), macOS only |
-| `dlp.go` | DLP rules (`builtinRules`), card search (`cardsIn`) and Luhn check, user keyword rules, `scan` and `summary` |
-| `metrics.go` | Metrics store: schema, private file creation, batched writer, retention, `recorder` interface |
-| `metrics_query.go` | `swarmsheriff metrics` CLI: query report, NDJSON export, clear |
-| `lifecycle.go` | `swarmsheriff hook` client and Claude Code mapping, hook socket server, provider and model extraction |
-| `lifecycle_query.go` | Lifecycle fold (time in state, blocked, turns, waits, errors, stalls), launch stats, resource usage |
-| `adapters.go` | Declarative hook-adapter engine: add a new agent via `<name>.json` in the adapters dir (`~/.config/swarmsheriff/adapters/`, see `docs/adapters/example.json`) |
-| `guard.go` | Clipboard guard: trigger rules, notice text, clipboard writers, AI-context checks |
-| `intake.go` | Optional `/scan` and `/healthz` HTTP endpoint with bearer-token auth |
-| `rotate.go` | `rotatingFile`, a size and line-count rotating `io.Writer` |
-| `policy.go` | Load and validate the JSON policy; `Verdict`; class definitions; destination matrix; path globs |
-| `decide.go` | The decision pipeline (`decider.decide`); returns a `Decision`; classifier features |
-| `classify.go` | `Classifier` interface, `noopClassifier`, the Jev implementation |
-| `proxy.go` | LLM reverse proxy; `judge` (identity, `decide`, events) shared with the gateway; blocks or forwards; block response shapes |
-| `gateway.go` | Google Agent Gateway CONTENT_AUTHZ extension: Envoy ext_proc server, buffers the request body, then 403 or passes it back unchanged |
-| `events.go` | `Sink` interface and the logfmt file sink |
-| `sentinel.go` | SwarmSentinel link: credential resolution, the asynchronous recorder sink, `multiSink` |
-| `translate.go` | `Translator` interface stub for surrogate values (DPTP) |
-| `eval.go` | The `-eval` mode that scores the pipeline against a labeled corpus |
+| `cmd/swarmsheriff/main.go` | Flags, clipboard polling loop, `logClipboard`, policy reload, wiring of the other components |
+| `internal/dlp` | DLP rules (`BuiltinRules`), card search (`cardsIn`) and Luhn check, user keyword rules, `Scanner.Scan` and `Summary` |
+| `internal/llm` | Provider names from hosts (`Provider`), model names from request bodies and Gemini or Vertex paths |
+| `internal/netutil` | `IsLoopback`, shared by every loopback-only listener |
+| `internal/logfile` | `Open`, a size and line-count rotating `io.Writer` |
+| `internal/policy` | Load and validate the JSON policy; `Verdict`; class definitions; destination matrix; path globs |
+| `internal/classify` | `Classifier` interface, `Noop`, the Jev implementation |
+| `internal/decide` | The decision pipeline (`Decider.Decide`); returns a `Decision`; classifier features |
+| `internal/translate` | `Translator` interface stub for surrogate values (DPTP) |
+| `internal/events` | Decision `Event`, the `Sink` interface and the logfmt `LogSink` |
+| `internal/sentinel` | SwarmSentinel link: credential resolution (`Client`), the asynchronous recorder sink, `MultiSink` |
+| `internal/metrics` | `store.go`: schema, private file creation, batched writer, retention, `Recorder`, event kinds. `query.go`: `swarmsheriff metrics` CLI (query report, NDJSON export, clear). `lifecycle.go`: lifecycle fold (time in state, blocked, turns, waits, errors, stalls), launch stats, resource usage |
+| `internal/hooks` | `hooks.go`: `swarmsheriff hook` client, Claude Code, Antigravity and Gemini CLI mapping, hook socket server. `adapters.go`: declarative hook adapters, a new agent via `<name>.json` in the adapters dir (`~/.config/swarmsheriff/adapters/`, see `docs/adapters/example.json`) |
+| `internal/proxy` | `proxy.go`: LLM reverse proxy; `judge` (identity, `Decide`, events) shared with the gateway; blocks or forwards; block response shapes. `gateway.go`: Google Agent Gateway CONTENT_AUTHZ extension, an Envoy ext_proc server that buffers the request body, then answers 403 or passes it back unchanged |
+| `internal/watch` | `process.go`: AI app detection from the process list (`AIApps`), grouping helpers, command-line redaction, resource sampling. `browser.go`: AI site detection in Chrome tabs via `osascript` (`aiSites`), macOS only |
+| `internal/clipboard` | `clipboard.go`: clipboard reads. `guard.go`: clipboard guard (trigger rules, notice text, clipboard writers, AI-context checks) |
+| `internal/intake` | Optional `/scan` and `/healthz` HTTP endpoint with bearer-token auth |
+| `internal/dashboard` | `swarmsheriff dashboard`: read-only web view of the metrics database; `html.go` holds the page |
+| `internal/eval` | The `-eval` mode that scores the pipeline against a labeled corpus |
 | `policy.example.json` | Example policy; the real classes are an owner decision |
 | `testdata/corpus/` | Synthetic labeled samples, `<class>.positive.txt` / `<class>.negative.txt`, `---` between samples |
 | `docs/ARCHITECTURE.md` | Architecture and design decisions: components, endpoints, storage, access, failure behavior |
 | `docs/CAPABILITIES.md` | Plain-language capabilities overview for product and sales use |
 | `docs/ROADMAP.md` | Phased plan: OS-level (`lsof`/`/proc`), network, browser, and enforcement |
 
-The SwarmSentinel link (identity, labels and the recorder sink) is in `sentinel.go`; see SwarmSentinel's docs/egress-monitor.md.
+The SwarmSentinel link (identity, labels and the recorder sink) is in `internal/sentinel`; see SwarmSentinel's docs/egress-monitor.md.
 
 ## Platform behavior
 
@@ -145,7 +143,7 @@ Existing:
 
 - DLP `scan` returns rule names and counts only, never the matched text. Log `dlp=` summaries, not values.
 - With `-log-content=false`, raw clipboard and intake text must never reach the log.
-- The intake endpoint refuses non-loopback addresses (`isLoopback`), compares tokens with `subtle.ConstantTimeCompare`, caps bodies at `maxIntakeBytes`, and prints a generated token to stderr only, never to the log.
+- The intake endpoint refuses non-loopback addresses (`netutil.IsLoopback`), compares tokens with `subtle.ConstantTimeCompare`, caps bodies at `maxIntakeBytes`, and prints a generated token to stderr only, never to the log.
 - Browser watching logs the host only, never the URL path or query.
 - Process command lines go through `sanitizeCmd` (redacts key/token/secret args, truncates to 300 chars) before logging.
 - Log files are created with mode `0600`.
@@ -158,7 +156,7 @@ Existing:
 New, for the enforcement work:
 
 - A `Decision` carries class IDs, rule names, confidence, verdict, mode, agent ID, and destination host. It never carries request content, matched text, or prompts. The same holds for every event sent to a sink.
-- The proxy binds to loopback only, reusing `isLoopback`. It does no TLS interception. The one listener that is not loopback is the opt-in Agent Gateway extension (`-gateway-listen`), off by default, which refuses to start without a TLS certificate and key and holds request bodies in memory only until it decides, like the proxy. Agents reach it through a base-URL override (for example `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` pointing at `http://127.0.0.1:<port>`).
+- The proxy binds to loopback only, reusing `netutil.IsLoopback`. It does no TLS interception. The one listener that is not loopback is the opt-in Agent Gateway extension (`-gateway-listen`), off by default, which refuses to start without a TLS certificate and key and holds request bodies in memory only until it decides, like the proxy. Agents reach it through a base-URL override (for example `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` pointing at `http://127.0.0.1:<port>`).
 - Request bodies are capped. Streaming responses pass through as they arrive; the proxy scans them in flight only to read the `usage` token counts, keeping the integers and never buffering or storing the body. The proxy never stores a request or response body, in memory beyond the request or on disk.
 - API keys and authorization headers pass through to the upstream and are never logged.
 - A hosted classifier never receives raw request content by default. It receives features (path labels, document markers, length, rule counts) or text that has already been through the `Translator`. A class may opt in to raw content only with `"classifier_raw": true` in the policy, and that choice must be visible in the startup log.
@@ -173,7 +171,7 @@ Evaluate signals in this order and stop at the first definite hit:
 
 1. **Source labels.** Data read from a labeled source (repo, directory, share, database) carries that label forward. Labels come from the policy file and from `X-Swarmsheriff-Labels` request headers set by trusted launchers.
 2. **Fingerprints.** Exact hashes of known documents, customer ID lists, project codenames.
-3. **Patterns and keywords.** The rules in `dlp.go` plus per-class rules from the policy.
+3. **Patterns and keywords.** The rules in `internal/dlp` plus per-class rules from the policy.
 4. **Classifier.** Only for text that steps 1 to 3 left ambiguous, and only if the class enables it.
 
 As built: steps 1 to 3 are cheap, so they run for every class (path globs count with source labels). Stopping early would let one class's hit hide a stricter class. The classifier then runs only for enabled classes with no deterministic hit whose action at this destination is stricter than the verdict so far. A deterministic `block` skips it entirely.
@@ -234,7 +232,7 @@ JSON, because the standard library has no YAML parser. Classes are data. Adding 
 Rules for the schema:
 
 - Every class needs `id`, `description`, `owner`, and an `actions` entry for every destination category.
-- `detectors.rules` entries are a built-in rule name from `dlp.go` (`"aws-access-key"`) or a regular expression prefixed with `re:`.
+- `detectors.rules` entries are a built-in rule name from `internal/dlp` (`"aws-access-key"`) or a regular expression prefixed with `re:`.
 - `detectors.fingerprints` (optional) holds lowercase hex SHA-256 hashes. A request matches when the hash of its whole text, or of any trimmed line of 20 or more bytes, is listed.
 - `classifier.hold_at` of 0 means no hold band.
 - Unknown fields are rejected, so a typo cannot silently disable a detector.
@@ -245,7 +243,7 @@ Rules for the schema:
 
 ## Classifier
 
-`Classifier` is an interface in `classify.go`. The pipeline depends on the interface, not on a vendor.
+`Classifier` is an interface in `internal/classify`. The pipeline depends on the interface, not on a vendor.
 
 Jev is the first implementation:
 
@@ -257,7 +255,7 @@ Jev is the first implementation:
 - Treat output as advisory evidence. A wrong label from manipulated text is possible, so hard rules stay outside the classifier.
 - Check the current API, model ID, and pricing in the OpenRouter and TypeSafe docs before writing the client. Do not rely on this file for request or response shapes.
 
-A second implementation that runs locally (a downloadable System One model) is a likely follow-up. Do not hard-code Jev assumptions outside `classify.go`.
+A second implementation that runs locally (a downloadable System One model) is a likely follow-up. Do not hard-code Jev assumptions outside `internal/classify`.
 
 ## SwarmSentinel integration
 
@@ -313,9 +311,9 @@ Exit criteria. These are proposals, so confirm them with the owner before treati
 
 ## Extending
 
-- New AI desktop or CLI app: add an `app(...)` entry to `aiApps` in `procwatch.go` using `macApp`, `exeName`, or `contains`. Order matters: the first match wins, so put specific bundle matches before broad executable names.
-- New AI website: add the host suffix to `aiSites` in `browserwatch.go`.
-- New DLP rule: add to `builtinRules` in `dlp.go`. Match on structure, not real values, and add a `validate` func when the pattern alone is noisy (see `luhnValid`).
+- New AI desktop or CLI app: add an `app(...)` entry to `AIApps` in `internal/watch/process.go` using `macApp`, `exeName`, or `contains`. Order matters: the first match wins, so put specific bundle matches before broad executable names.
+- New AI website: add the host suffix to `aiSites` in `internal/watch/browser.go`.
+- New DLP rule: add to `BuiltinRules` in `internal/dlp/dlp.go`. Match on structure, not real values, and add a `validate` func when the pattern alone is noisy (see `luhnValid`).
 - New company class: add an entry to the policy file. No code change.
 - New LLM API provider for the proxy: add its host to the destination lists and check how it carries the model and body, so size caps and streaming still work.
 - New flag: define it in `main()` alongside the others and include it in the `swarmsheriff started` log line if it affects behavior.

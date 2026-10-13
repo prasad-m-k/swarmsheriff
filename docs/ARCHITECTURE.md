@@ -65,24 +65,25 @@ flowchart LR
 
 | Component | File | Responsibility |
 | --- | --- | --- |
-| Main loop | `main.go` | Flags, startup checks, polling tickers, policy reload, shutdown |
-| Clipboard watcher | `main.go` | Polls the OS clipboard every 500 ms; logs changes with DLP findings |
-| Clipboard guard | `guard.go` | Optional: replaces a sensitive clipboard with a notice |
-| AI process watcher | `procwatch.go` | Scans the process list every 5 s; logs AI apps starting and stopping |
-| Chrome tab watcher | `browserwatch.go` | Reads Chrome tab URLs via AppleScript (macOS); logs AI site hosts only |
-| DLP scanner | `dlp.go` | Built-in secret and PII patterns plus user keywords; returns rule names and counts |
-| Intake | `intake.go` | Loopback HTTP endpoint for other tools to submit text for a DLP scan |
-| Policy | `policy.go` | Loads, validates, and compiles the JSON policy |
-| Decider | `decide.go` | The decision pipeline; produces a content-free `Decision` |
-| Classifier | `classify.go` | Interface; no-op default; Jev client over OpenRouter |
-| LLM proxy | `proxy.go` | Loopback reverse proxy; decides, then blocks or forwards |
-| Event sink | `events.go` | `Sink` interface; logfmt sink to the rotating log |
-| Translator | `translate.go` | Interface stub for surrogate values |
-| Eval | `eval.go` | Scores the pipeline against a labeled corpus |
-| Rotating log | `rotate.go` | Size and line based rotation with numbered backups |
-| Metrics store | `metrics.go`, `metrics_query.go` | Local SQLite of body-free events; `swarmsheriff metrics` CLI |
-| Agent lifecycle | `lifecycle.go`, `lifecycle_query.go` | `swarmsheriff hook` for Claude Code hooks, hook socket, lifecycle fold, launch and resource metrics |
-| Dashboard | `dashboard.go`, `dashboard_html.go` | `swarmsheriff dashboard`: loopback web view of the metrics database (phase 2) |
+| Main loop | `cmd/swarmsheriff/main.go` | Flags, startup checks, polling tickers, policy reload, shutdown |
+| Clipboard watcher | `internal/clipboard/clipboard.go`, `cmd/swarmsheriff/main.go` | Polls the OS clipboard every 500 ms; logs changes with DLP findings |
+| Clipboard guard | `internal/clipboard/guard.go` | Optional: replaces a sensitive clipboard with a notice |
+| AI process watcher | `internal/watch/process.go` | Scans the process list every 5 s; logs AI apps starting and stopping |
+| Chrome tab watcher | `internal/watch/browser.go` | Reads Chrome tab URLs via AppleScript (macOS); logs AI site hosts only |
+| DLP scanner | `internal/dlp` | Built-in secret and PII patterns plus user keywords; returns rule names and counts |
+| Intake | `internal/intake` | Loopback HTTP endpoint for other tools to submit text for a DLP scan |
+| Policy | `internal/policy` | Loads, validates, and compiles the JSON policy |
+| Decider | `internal/decide` | The decision pipeline; produces a content-free `Decision` |
+| Classifier | `internal/classify` | Interface; no-op default; Jev client over OpenRouter |
+| LLM proxy | `internal/proxy/proxy.go` | Loopback reverse proxy; decides, then blocks or forwards |
+| Gateway extension | `internal/proxy/gateway.go` | Agent Gateway CONTENT_AUTHZ extension (ext_proc over TLS); same `judge` as the proxy |
+| Event sink | `internal/events`, `internal/sentinel` | `Sink` interface; logfmt sink to the rotating log; SwarmSentinel recorder sink |
+| Translator | `internal/translate` | Interface stub for surrogate values |
+| Eval | `internal/eval` | Scores the pipeline against a labeled corpus |
+| Rotating log | `internal/logfile` | Size and line based rotation with numbered backups |
+| Metrics store | `internal/metrics/store.go`, `internal/metrics/query.go` | Local SQLite of body-free events; `swarmsheriff metrics` CLI |
+| Agent lifecycle | `internal/hooks`, `internal/metrics/lifecycle.go` | `swarmsheriff hook` for Claude Code hooks, hook socket, lifecycle fold, launch and resource metrics |
+| Dashboard | `internal/dashboard` | `swarmsheriff dashboard`: loopback web view of the metrics database (phase 2) |
 
 ## Request flow
 
@@ -276,7 +277,7 @@ Event kinds: `agent_started`, `agent_stopped`, `decision`, `clipboard`, `clipboa
 
 ### Agent lifecycle metrics (phase 1.1, after c11)
 
-An agent runs `swarmsheriff hook [--agent <kind>] <Event>` for each hook; `swarmsheriff hook --print-config [claude-code|antigravity|gemini-cli]` prints the config fragment. The command maps that agent's payload (Claude Code as c11's `ClaudeHookMapping` does; Antigravity from its `conversationId`, `toolCall`, `modelName` payload; Gemini CLI from `session_id` and `llm_request.model`) and sends only the event name, opaque session/prompt/tool-use IDs, a tool class (`ask_user_question`, `exit_plan_mode`, `other`), and the model, over the hook socket. The three built-in agents are hand-written Go; every other agent is added declaratively by dropping a `<name>.json` adapter in the adapters directory (`~/.config/swarmsheriff/adapters/` by default, or `--adapters <dir>`), with no recompile. See `adapters.go` and `docs/adapters/example.json`. `swarmsheriff hook --list-agents` lists built-in and custom agents.
+An agent runs `swarmsheriff hook [--agent <kind>] <Event>` for each hook; `swarmsheriff hook --print-config [claude-code|antigravity|gemini-cli]` prints the config fragment. The command maps that agent's payload (Claude Code as c11's `ClaudeHookMapping` does; Antigravity from its `conversationId`, `toolCall`, `modelName` payload; Gemini CLI from `session_id` and `llm_request.model`) and sends only the event name, opaque session/prompt/tool-use IDs, a tool class (`ask_user_question`, `exit_plan_mode`, `other`), and the model, over the hook socket. The three built-in agents are hand-written Go; every other agent is added declaratively by dropping a `<name>.json` adapter in the adapters directory (`~/.config/swarmsheriff/adapters/` by default, or `--adapters <dir>`), with no recompile. See `internal/hooks/adapters.go` and `docs/adapters/example.json`. `swarmsheriff hook --list-agents` lists built-in and custom agents.
 
 Antigravity differs from Claude Code in two ways: it has no session start/end event, so a session is keyed on `conversationId` and first-seen marks it (its sessions appear under `seen`, not `started`); and it signals waiting-on-the-operator through the hook's own `decision` output rather than an event, so operator-wait timing is not available in observe-only mode. Gemini CLI sends `session_id` on every event but no turn or tool-call ID, so its tool events count as activity and cannot resolve a question or plan review; a `ToolPermission` notification counts as an approval request, and `BeforeModel` contributes only the model name. `swarmsheriff metrics query` folds them per session:
 

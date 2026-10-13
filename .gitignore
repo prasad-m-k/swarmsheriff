@@ -1,4 +1,4 @@
-swarmsheriff
+/swarmsheriff
 *.log
 .DS_Store
 graphify-out/
